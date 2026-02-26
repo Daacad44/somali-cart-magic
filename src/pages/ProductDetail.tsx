@@ -4,6 +4,7 @@ import { Star, ShoppingCart, Heart, Truck, Shield, ArrowLeft } from "lucide-reac
 import { motion } from "framer-motion";
 import { products } from "@/lib/mock-data";
 import { useCart } from "@/lib/cart-context";
+import { productImages } from "@/lib/product-images";
 
 const ProductDetail = () => {
   const { slug } = useParams();
@@ -38,9 +39,11 @@ const ProductDetail = () => {
       <div className="grid gap-10 lg:grid-cols-2">
         {/* Image */}
         <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="aspect-square overflow-hidden rounded-2xl border border-border bg-muted">
-          <div className="flex h-full items-center justify-center text-8xl">
-            {product.category === "Electronics" ? "🎧" : product.category === "Fashion" ? "👗" : product.category === "Beauty" ? "✨" : product.category === "Home & Living" ? "🏠" : product.category === "Sports" ? "👟" : "📦"}
-          </div>
+          <img
+            src={productImages[product.id]}
+            alt={product.name}
+            className="h-full w-full object-cover"
+          />
         </motion.div>
 
         {/* Details */}
