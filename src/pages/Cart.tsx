@@ -2,6 +2,7 @@ import { Link } from "react-router-dom";
 import { Trash2, Plus, Minus, ArrowLeft, ShoppingCart } from "lucide-react";
 import { useCart } from "@/lib/cart-context";
 import { motion } from "framer-motion";
+import { productImages } from "@/lib/product-images";
 
 const Cart = () => {
   const { items, updateQuantity, removeFromCart, totalPrice, totalItems } = useCart();
@@ -36,8 +37,8 @@ const Cart = () => {
         <div className="lg:col-span-2 space-y-3">
           {items.map((item) => (
             <motion.div key={item.product.id} layout className="flex gap-4 rounded-xl border border-border bg-card p-4">
-              <div className="flex h-20 w-20 shrink-0 items-center justify-center rounded-lg bg-muted text-2xl">
-                {item.product.category === "Electronics" ? "🎧" : item.product.category === "Fashion" ? "👗" : "📦"}
+              <div className="h-20 w-20 shrink-0 overflow-hidden rounded-lg bg-muted">
+                <img src={productImages[item.product.id]} alt={item.product.name} className="h-full w-full object-cover" />
               </div>
               <div className="flex flex-1 flex-col justify-between">
                 <div className="flex items-start justify-between gap-2">

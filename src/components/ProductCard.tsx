@@ -3,6 +3,7 @@ import { Heart, ShoppingCart, Star } from "lucide-react";
 import { motion } from "framer-motion";
 import type { Product } from "@/lib/mock-data";
 import { useCart } from "@/lib/cart-context";
+import { productImages } from "@/lib/product-images";
 
 interface ProductCardProps {
   product: Product;
@@ -24,9 +25,11 @@ const ProductCard = ({ product, index = 0 }: ProductCardProps) => {
     >
       {/* Image */}
       <Link to={`/product/${product.slug}`} className="relative block aspect-square overflow-hidden bg-muted">
-        <div className="flex h-full items-center justify-center text-4xl">
-          {product.category === "Electronics" ? "🎧" : product.category === "Fashion" ? "👗" : product.category === "Beauty" ? "✨" : product.category === "Home & Living" ? "🏠" : product.category === "Sports" ? "👟" : "📦"}
-        </div>
+        <img
+          src={productImages[product.id]}
+          alt={product.name}
+          className="h-full w-full object-cover transition-transform duration-500 group-hover:scale-105"
+        />
         {discount > 0 && (
           <span className="absolute left-3 top-3 rounded-md bg-secondary px-2 py-0.5 text-xs font-bold text-secondary-foreground">
             -{discount}%
