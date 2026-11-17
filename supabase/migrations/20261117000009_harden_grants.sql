@@ -3,7 +3,8 @@
 revoke execute on function public.cancel_order(uuid, text) from public, anon;
 revoke execute on function public.create_order(jsonb, jsonb, text, uuid, numeric) from public, anon;
 revoke execute on function public.dashboard_stats(int) from public, anon;
-revoke execute on function public.has_permission(text) from public, anon;
+-- has_permission stays executable by anon: RLS policies call it for anonymous visitors
+-- (it returns false when auth.uid() is null).
 revoke execute on function public.is_staff() from public, anon;
 revoke execute on function public.my_permissions() from public, anon;
 revoke execute on function public.resolve_order_review(uuid, text) from public, anon;
