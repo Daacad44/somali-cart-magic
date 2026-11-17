@@ -7,7 +7,7 @@ import { WALLET_LABELS, maskPhone, normalizeSomaliPhone } from "@/lib/wallet";
 import { useI18n, type Lang } from "@/lib/i18n";
 import posDict from "@/i18n/pos";
 import commonDict from "@/i18n/common";
-import { useReceiptOrder, useStoreSettings } from "@/hooks/pos";
+import { useReceiptOrder, useStaffName, useStoreSettings } from "@/hooks/pos";
 import { Button } from "@/components/ui/button";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -244,6 +244,7 @@ export function ReceiptPrint({ orderId }: { orderId: string }) {
   const [printing, setPrinting] = useState(false);
   const orderQ = useReceiptOrder(orderId);
   const settingsQ = useStoreSettings();
+  const cashierQ = useStaffName(orderQ.data?.created_by);
 
   if (orderQ.isLoading || settingsQ.isLoading) {
     return (
@@ -271,7 +272,7 @@ export function ReceiptPrint({ orderId }: { orderId: string }) {
   const onPrint = async () => {
     setPrinting(true);
     try {
-      await printReceipt(order, settings, { size, lang });
+      await printReceipt(order, settings, { size, lang, cashierName: cashierQ.data });
     } catch {
       /* the browser shows its own error */
     } finally {
@@ -299,7 +300,7 @@ export function ReceiptPrint({ orderId }: { orderId: string }) {
         </Button>
       </div>
       <div className={`rcpt-preview ${size === "a4" ? "max-w-[720px] p-6" : "max-w-[340px]"}`}>
-        <ReceiptView order={order} settings={settings} size={size} lang={lang} />
+        <ReceiptView order={order} settings={settings} cashierName={cashierQ.data} size={size} lang={lang} />
       </div>
     </div>
   );

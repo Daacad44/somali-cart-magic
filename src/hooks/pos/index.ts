@@ -227,3 +227,17 @@ export function useReceiptOrder(orderId: string | null | undefined) {
     queryFn: () => fetchOrderForReceipt(orderId!),
   });
 }
+
+/** Display name of a staff member (cashier on reprinted receipts). */
+export function useStaffName(userId: string | null | undefined) {
+  return useQuery({
+    queryKey: ["pos", "staff-name", userId ?? ""],
+    enabled: Boolean(userId),
+    staleTime: 10 * 60_000,
+    queryFn: async () => {
+      const { data, error } = await supabase.rpc("staff_display_name", { p_user_id: userId });
+      if (error) throw error;
+      return (data as string | null) ?? null;
+    },
+  });
+}
