@@ -1,210 +1,350 @@
-import { useState } from "react";
-import { Link } from "react-router-dom";
-import { ArrowLeft, Check, CreditCard, MapPin, Phone } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { Link, useNavigate } from "react-router-dom";
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { z } from "zod";
+import { ArrowLeft, Check, CreditCard, MapPin, Pencil, ShoppingCart, Loader2, Lock } from "lucide-react";
 import { motion } from "framer-motion";
+import { toast } from "sonner";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Label } from "@/components/ui/label";
+import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
+import { supabase, rpcErrorMessage } from "@/integrations/supabase/client";
+import type { Order } from "@/integrations/supabase/types";
 import { useCart } from "@/lib/cart-context";
-import { paymentMethods } from "@/lib/mock-data";
+import { useAuth } from "@/lib/auth";
+import { useI18n } from "@/lib/i18n";
+import { cn } from "@/lib/utils";
+import { previewTotals } from "@/lib/cart-utils";
+import { WALLET_LABELS, formatSomaliPhone, normalizeSomaliPhone } from "@/lib/wallet";
+import { useStoreSettings } from "@/hooks/store/useCatalog";
+import { useMyCustomer } from "@/hooks/store/useCustomer";
+import { usePayErrorMessage, usePayOrder } from "@/hooks/store/usePayOrder";
+import { productImage } from "@/hooks/store/query-utils";
+import EmptyState from "@/components/store/EmptyState";
+import OrderTotals from "@/components/store/OrderTotals";
+import CartNotice from "@/components/store/CartNotice";
+import PaymentWaiting from "@/components/store/PaymentWaiting";
+import WalletPhoneInput from "@/components/store/WalletPhoneInput";
+import { useWalletDetection } from "@/hooks/store/useWalletDetection";
+
+type Step = "shipping" | "payment";
+
+function useShippingSchema() {
+  const { t } = useI18n();
+  return useMemo(
+    () =>
+      z.object({
+        name: z.string().trim().min(2, t("store.checkout.v.name")).max(100),
+        phone: z.string().trim().refine((v) => !!normalizeSomaliPhone(v), t("store.v.phone")),
+        city: z.string().trim().min(2, t("store.checkout.v.city")).max(60),
+        district: z.string().trim().max(60).optional().or(z.literal("")),
+        address: z.string().trim().min(3, t("store.checkout.v.address")).max(200),
+        notes: z.string().trim().max(500).optional().or(z.literal("")),
+      }),
+    [t],
+  );
+}
+type ShippingValues = z.infer<ReturnType<typeof useShippingSchema>>;
 
 const Checkout = () => {
-  const { items, totalPrice, clearCart } = useCart();
-  const [step, setStep] = useState<"shipping" | "payment" | "confirm">("shipping");
-  const [selectedPayment, setSelectedPayment] = useState("");
-  const [phoneNumber, setPhoneNumber] = useState("");
-  const [orderPlaced, setOrderPlaced] = useState(false);
+  const { items, subtotal, clearCart, revalidate, revalidating } = useCart();
+  const { profile } = useAuth();
+  const { t, lang, pick, formatMoney } = useI18n();
+  const navigate = useNavigate();
+  const { data: settings } = useStoreSettings();
+  const customer = useMyCustomer();
+  const schema = useShippingSchema();
+  const { pay, paying, startedAt } = usePayOrder();
+  const payErrorMessage = usePayErrorMessage();
 
-  const shipping = 5.99;
-  const tax = totalPrice * 0.05;
-  const total = totalPrice + shipping + tax;
+  const [step, setStep] = useState<Step>("shipping");
+  const [shipping, setShipping] = useState<ShippingValues | null>(null);
+  const [payPhone, setPayPhone] = useState("");
+  const [saveAddress, setSaveAddress] = useState(true);
+  const [placing, setPlacing] = useState(false);
+  const [createdOrder, setCreatedOrder] = useState<Order | null>(null);
+  const detection = useWalletDetection(payPhone);
 
-  if (orderPlaced) {
+  const currency = settings?.currency ?? "USD";
+  const totals = previewTotals(subtotal, settings);
+
+  const form = useForm<ShippingValues>({
+    resolver: zodResolver(schema),
+    defaultValues: { name: "", phone: "", city: "", district: "", address: "", notes: "" },
+  });
+
+  // Make sure prices/stock are fresh before the customer reviews the order.
+  useEffect(() => {
+    void revalidate();
+  }, [revalidate]);
+
+  // Prefill from the customer profile (only if the user hasn't typed yet).
+  useEffect(() => {
+    if (form.formState.isDirty) return;
+    const c = customer.data;
+    if (!c && !profile) return;
+    form.reset({
+      name: c?.full_name || profile?.full_name || "",
+      phone: c?.phone || profile?.phone || "",
+      city: c?.city || "",
+      district: c?.district || "",
+      address: c?.address || "",
+      notes: "",
+    });
+  }, [customer.data, profile]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const onShippingSubmit = (values: ShippingValues) => {
+    setShipping(values);
+    if (!payPhone) setPayPhone(values.phone);
+    setStep("payment");
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
+  const placeOrder = async () => {
+    if (!shipping || placing || !detection.canPay || !detection.normalized) return;
+    setPlacing(true);
+    const shipPhone = normalizeSomaliPhone(shipping.phone) ?? shipping.phone;
+    let order: Order;
+    try {
+      const { data, error } = await supabase.rpc("create_order", {
+        p_items: items.map((i) => ({ product_id: i.product.id, quantity: i.quantity, variants: i.variants })),
+        p_shipping: {
+          name: shipping.name,
+          phone: shipPhone,
+          address: shipping.address,
+          city: shipping.city,
+          district: shipping.district || null,
+          notes: shipping.notes || null,
+        },
+        p_channel: "online",
+      });
+      if (error) throw error;
+      order = data as Order;
+    } catch (err) {
+      toast.error(rpcErrorMessage(err, lang));
+      void revalidate();
+      setPlacing(false);
+      return;
+    }
+
+    // The order now holds the items (with server prices): empty the cart so it can't be ordered twice.
+    setCreatedOrder(order);
+    clearCart();
+
+    if (saveAddress && customer.data) {
+      customer.update.mutate({
+        full_name: shipping.name,
+        phone: shipPhone,
+        address: shipping.address,
+        city: shipping.city,
+        district: shipping.district || null,
+      });
+    }
+
+    const res = await pay(order.id, detection.normalized);
+    setPlacing(false);
+    if (res.ok) {
+      toast.success(t("store.pay.success"));
+      navigate(`/order/${order.id}`, { replace: true, state: { justPaid: true } });
+    } else {
+      navigate(`/order/${order.id}`, { replace: true, state: { payError: payErrorMessage(res) } });
+    }
+  };
+
+  // While an order is being paid the cart is already empty — keep showing the waiting state.
+  if (createdOrder) {
     return (
       <div className="container mx-auto flex min-h-[50vh] items-center justify-center px-4">
-        <motion.div initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} className="text-center">
-          <div className="mx-auto flex h-20 w-20 items-center justify-center rounded-full bg-success">
-            <Check className="h-10 w-10 text-success-foreground" />
-          </div>
-          <h2 className="mt-5 font-heading text-2xl font-bold">Order Confirmed!</h2>
-          <p className="mt-2 text-sm text-muted-foreground">Your order has been placed. You'll receive a confirmation via SMS.</p>
-          <p className="mt-1 text-sm text-muted-foreground">Transaction ID: <span className="font-mono font-semibold text-foreground">TXN-{Date.now()}</span></p>
-          <Link to="/products" className="mt-6 inline-flex items-center gap-2 rounded-lg bg-primary px-6 py-2.5 text-sm font-semibold text-primary-foreground">
-            Continue Shopping
-          </Link>
-        </motion.div>
+        <div className="text-center text-sm text-muted-foreground">
+          <Loader2 className="mx-auto h-8 w-8 animate-spin" />
+          <p className="mt-3">{t("store.checkout.orderCreated", { number: createdOrder.order_number })}</p>
+        </div>
+        <PaymentWaiting
+          open={paying}
+          startedAt={startedAt}
+          walletLabel={detection.wallet ? WALLET_LABELS[detection.wallet.wallet] : null}
+          phone={detection.normalized}
+          amount={formatMoney(createdOrder.total, createdOrder.currency)}
+        />
       </div>
     );
   }
 
   if (items.length === 0) {
     return (
-      <div className="container mx-auto flex min-h-[50vh] items-center justify-center px-4">
-        <div className="text-center">
-          <p className="text-lg font-semibold">No items to checkout</p>
-          <Link to="/products" className="mt-2 text-sm text-accent">Go shopping →</Link>
-        </div>
-      </div>
+      <EmptyState
+        icon={ShoppingCart}
+        title={t("store.checkout.emptyTitle")}
+        description={t("store.cart.emptyDesc")}
+        action={<Button asChild><Link to="/products">{t("store.cart.startShopping")}</Link></Button>}
+      />
     );
   }
+
+  const steps: { id: Step; label: string }[] = [
+    { id: "shipping", label: t("store.checkout.stepShipping") },
+    { id: "payment", label: t("store.checkout.stepPayment") },
+  ];
+  const stepIdx = steps.findIndex((s) => s.id === step);
 
   return (
     <div className="container mx-auto px-4 py-8 lg:px-8">
       <Link to="/cart" className="mb-6 inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground">
-        <ArrowLeft className="h-4 w-4" /> Back to Cart
+        <ArrowLeft className="h-4 w-4" /> {t("store.checkout.backToCart")}
       </Link>
-      <h1 className="font-heading text-3xl font-bold">Checkout</h1>
+      <h1 className="font-heading text-3xl font-bold">{t("store.checkout.title")}</h1>
 
-      {/* Steps indicator */}
-      <div className="mt-6 flex items-center gap-2 text-sm">
-        {["shipping", "payment", "confirm"].map((s, i) => (
-          <div key={s} className="flex items-center gap-2">
-            <div className={`flex h-7 w-7 items-center justify-center rounded-full text-xs font-bold ${
-              step === s ? "bg-primary text-primary-foreground" : i < ["shipping", "payment", "confirm"].indexOf(step) ? "bg-success text-success-foreground" : "bg-muted text-muted-foreground"
-            }`}>
-              {i < ["shipping", "payment", "confirm"].indexOf(step) ? <Check className="h-3.5 w-3.5" /> : i + 1}
-            </div>
-            <span className={`capitalize ${step === s ? "font-semibold text-foreground" : "text-muted-foreground"}`}>{s}</span>
-            {i < 2 && <div className="mx-1 h-px w-8 bg-border" />}
-          </div>
-        ))}
-      </div>
-
-      <div className="mt-8 grid gap-8 lg:grid-cols-3">
-        <div className="lg:col-span-2">
-          {/* Shipping */}
-          {step === "shipping" && (
-            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="rounded-xl border border-border bg-card p-6">
-              <h3 className="flex items-center gap-2 font-heading text-lg font-bold"><MapPin className="h-5 w-5 text-accent" /> Shipping Address</h3>
-              <div className="mt-4 grid gap-4 sm:grid-cols-2">
-                <div>
-                  <label className="text-xs font-semibold text-muted-foreground">Full Name</label>
-                  <input className="mt-1 w-full rounded-lg border border-input bg-background px-3 py-2.5 text-sm outline-none ring-ring focus:ring-2" placeholder="Mohamed Ali" />
-                </div>
-                <div>
-                  <label className="text-xs font-semibold text-muted-foreground">Phone Number</label>
-                  <input className="mt-1 w-full rounded-lg border border-input bg-background px-3 py-2.5 text-sm outline-none ring-ring focus:ring-2" placeholder="+252 61 XXX XXXX" />
-                </div>
-                <div className="sm:col-span-2">
-                  <label className="text-xs font-semibold text-muted-foreground">Address</label>
-                  <input className="mt-1 w-full rounded-lg border border-input bg-background px-3 py-2.5 text-sm outline-none ring-ring focus:ring-2" placeholder="Street address" />
-                </div>
-                <div>
-                  <label className="text-xs font-semibold text-muted-foreground">City</label>
-                  <input className="mt-1 w-full rounded-lg border border-input bg-background px-3 py-2.5 text-sm outline-none ring-ring focus:ring-2" placeholder="Mogadishu" />
-                </div>
-                <div>
-                  <label className="text-xs font-semibold text-muted-foreground">District</label>
-                  <input className="mt-1 w-full rounded-lg border border-input bg-background px-3 py-2.5 text-sm outline-none ring-ring focus:ring-2" placeholder="Hodan" />
-                </div>
-              </div>
-              <button onClick={() => setStep("payment")} className="mt-6 rounded-lg bg-primary px-8 py-2.5 text-sm font-semibold text-primary-foreground transition-opacity hover:opacity-90">
-                Continue to Payment
-              </button>
-            </motion.div>
-          )}
-
-          {/* Payment */}
-          {step === "payment" && (
-            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="rounded-xl border border-border bg-card p-6">
-              <h3 className="flex items-center gap-2 font-heading text-lg font-bold"><CreditCard className="h-5 w-5 text-accent" /> Payment Method</h3>
-              <p className="mt-1 text-sm text-muted-foreground">Select your mobile money service</p>
-              <div className="mt-5 grid gap-3 sm:grid-cols-2">
-                {paymentMethods.map((pm) => (
-                  <button
-                    key={pm.id}
-                    onClick={() => setSelectedPayment(pm.id)}
-                    className={`flex items-center gap-3 rounded-xl border-2 p-4 text-left transition-all ${
-                      selectedPayment === pm.id ? "border-accent bg-accent/5 shadow-premium" : "border-border hover:border-accent/30"
-                    }`}
-                  >
-                    <span className="text-2xl">{pm.icon}</span>
-                    <div>
-                      <p className="text-sm font-bold">{pm.name}</p>
-                      <p className="text-xs text-muted-foreground">{pm.description}</p>
-                    </div>
-                    {selectedPayment === pm.id && (
-                      <Check className="ml-auto h-5 w-5 text-accent" />
-                    )}
-                  </button>
-                ))}
-              </div>
-              {selectedPayment && (
-                <div className="mt-5">
-                  <label className="flex items-center gap-1.5 text-xs font-semibold text-muted-foreground">
-                    <Phone className="h-3.5 w-3.5" /> Phone Number for {paymentMethods.find((p) => p.id === selectedPayment)?.name}
-                  </label>
-                  <input
-                    value={phoneNumber}
-                    onChange={(e) => setPhoneNumber(e.target.value)}
-                    className="mt-1 w-full rounded-lg border border-input bg-background px-3 py-2.5 text-sm outline-none ring-ring focus:ring-2"
-                    placeholder="+252 XX XXX XXXX"
-                  />
-                </div>
+      <ol className="mt-6 flex items-center gap-2 text-sm" aria-label={t("store.checkout.progress")}>
+        {steps.map((s, i) => (
+          <li key={s.id} className="flex items-center gap-2" aria-current={step === s.id ? "step" : undefined}>
+            <div
+              className={cn(
+                "flex h-7 w-7 items-center justify-center rounded-full text-xs font-bold",
+                step === s.id ? "bg-primary text-primary-foreground" : i < stepIdx ? "bg-success text-success-foreground" : "bg-muted text-muted-foreground",
               )}
-              <div className="mt-6 flex gap-3">
-                <button onClick={() => setStep("shipping")} className="rounded-lg border border-border px-6 py-2.5 text-sm font-medium text-muted-foreground hover:text-foreground">
-                  Back
-                </button>
-                <button
-                  onClick={() => setStep("confirm")}
-                  disabled={!selectedPayment || !phoneNumber}
-                  className="rounded-lg bg-primary px-8 py-2.5 text-sm font-semibold text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-50"
-                >
-                  Review Order
-                </button>
-              </div>
-            </motion.div>
-          )}
+            >
+              {i < stepIdx ? <Check className="h-3.5 w-3.5" /> : i + 1}
+            </div>
+            <span className={step === s.id ? "font-semibold text-foreground" : "text-muted-foreground"}>{s.label}</span>
+            {i < steps.length - 1 && <div className="mx-1 h-px w-8 bg-border" />}
+          </li>
+        ))}
+      </ol>
 
-          {/* Confirm */}
-          {step === "confirm" && (
-            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="rounded-xl border border-border bg-card p-6">
-              <h3 className="font-heading text-lg font-bold">Confirm Your Order</h3>
-              <div className="mt-4 rounded-lg border border-border p-4">
-                <p className="text-sm font-semibold">Payment: {paymentMethods.find((p) => p.id === selectedPayment)?.name}</p>
-                <p className="text-sm text-muted-foreground">Phone: {phoneNumber}</p>
-              </div>
-              <div className="mt-3 space-y-2">
-                {items.map((item) => (
-                  <div key={item.product.id} className="flex items-center justify-between text-sm">
-                    <span>{item.product.name} × {item.quantity}</span>
-                    <span className="font-semibold">${(item.product.price * item.quantity).toFixed(2)}</span>
+      <div className="mt-4"><CartNotice /></div>
+
+      <div className="mt-6 grid gap-8 lg:grid-cols-3">
+        <div className="lg:col-span-2">
+          {step === "shipping" && (
+            <motion.section initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="rounded-xl border border-border bg-card p-6">
+              <h2 className="flex items-center gap-2 font-heading text-lg font-bold">
+                <MapPin className="h-5 w-5 text-accent" aria-hidden /> {t("store.checkout.shippingTitle")}
+              </h2>
+              <Form {...form}>
+                <form onSubmit={form.handleSubmit(onShippingSubmit)} className="mt-4 grid gap-4 sm:grid-cols-2" noValidate>
+                  <FormField control={form.control} name="name" render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>{t("store.checkout.fullName")}</FormLabel>
+                      <FormControl><Input autoComplete="name" {...field} /></FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )} />
+                  <FormField control={form.control} name="phone" render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>{t("common.phone")}</FormLabel>
+                      <FormControl><Input type="tel" inputMode="tel" autoComplete="tel" placeholder="+252 61 234 5678" {...field} /></FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )} />
+                  <FormField control={form.control} name="city" render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>{t("store.checkout.city")}</FormLabel>
+                      <FormControl><Input autoComplete="address-level2" placeholder={t("store.checkout.cityPh")} {...field} /></FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )} />
+                  <FormField control={form.control} name="district" render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>{t("store.checkout.district")}</FormLabel>
+                      <FormControl><Input autoComplete="address-level3" placeholder={t("store.checkout.districtPh")} {...field} /></FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )} />
+                  <FormField control={form.control} name="address" render={({ field }) => (
+                    <FormItem className="sm:col-span-2">
+                      <FormLabel>{t("store.checkout.address")}</FormLabel>
+                      <FormControl><Input autoComplete="street-address" placeholder={t("store.checkout.addressPh")} {...field} /></FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )} />
+                  <FormField control={form.control} name="notes" render={({ field }) => (
+                    <FormItem className="sm:col-span-2">
+                      <FormLabel>{t("store.checkout.notes")}</FormLabel>
+                      <FormControl><Textarea rows={3} placeholder={t("store.checkout.notesPh")} {...field} /></FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )} />
+                  {customer.data && (
+                    <div className="flex items-center gap-2 sm:col-span-2">
+                      <Checkbox id="save-address" checked={saveAddress} onCheckedChange={(v) => setSaveAddress(v === true)} />
+                      <Label htmlFor="save-address" className="text-sm font-normal">{t("store.checkout.saveAddress")}</Label>
+                    </div>
+                  )}
+                  <div className="sm:col-span-2">
+                    <Button type="submit" size="lg">{t("store.checkout.continueToPayment")}</Button>
                   </div>
-                ))}
+                </form>
+              </Form>
+            </motion.section>
+          )}
+
+          {step === "payment" && shipping && (
+            <motion.section initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="space-y-6">
+              <div className="rounded-xl border border-border bg-card p-6">
+                <div className="flex items-start justify-between gap-4">
+                  <h2 className="flex items-center gap-2 font-heading text-lg font-bold">
+                    <MapPin className="h-5 w-5 text-accent" aria-hidden /> {t("store.checkout.deliverTo")}
+                  </h2>
+                  <Button variant="ghost" size="sm" onClick={() => setStep("shipping")} disabled={placing}>
+                    <Pencil className="mr-1 h-3.5 w-3.5" /> {t("common.edit")}
+                  </Button>
+                </div>
+                <address className="mt-2 text-sm not-italic text-muted-foreground">
+                  <span className="font-semibold text-foreground">{shipping.name}</span> · {formatSomaliPhone(shipping.phone)}<br />
+                  {shipping.address}, {[shipping.district, shipping.city].filter(Boolean).join(", ")}
+                  {shipping.notes && <><br /><em>{shipping.notes}</em></>}
+                </address>
               </div>
-              <div className="mt-4 flex gap-3">
-                <button onClick={() => setStep("payment")} className="rounded-lg border border-border px-6 py-2.5 text-sm font-medium text-muted-foreground hover:text-foreground">
-                  Back
-                </button>
-                <button
-                  onClick={() => { setOrderPlaced(true); clearCart(); }}
-                  className="flex-1 rounded-lg bg-secondary px-8 py-2.5 text-sm font-bold text-secondary-foreground transition-opacity hover:opacity-90"
+
+              <div className="rounded-xl border border-border bg-card p-6">
+                <h2 className="flex items-center gap-2 font-heading text-lg font-bold">
+                  <CreditCard className="h-5 w-5 text-accent" aria-hidden /> {t("store.checkout.paymentTitle")}
+                </h2>
+                <p className="mt-1 text-sm text-muted-foreground">{t("store.checkout.paymentDesc")}</p>
+                <div className="mt-4">
+                  <WalletPhoneInput value={payPhone} onChange={setPayPhone} detection={detection} disabled={placing} />
+                </div>
+                <Button
+                  size="lg"
+                  variant="secondary"
+                  className="mt-4 w-full font-bold"
+                  disabled={placing || revalidating || !detection.canPay}
+                  onClick={placeOrder}
                 >
-                  Place Order — ${total.toFixed(2)}
-                </button>
+                  {placing ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Lock className="mr-2 h-4 w-4" />}
+                  {t("store.checkout.placeOrder", { amount: formatMoney(totals.total, currency) })}
+                </Button>
+                <p className="mt-3 text-center text-xs text-muted-foreground">{t("store.checkout.placeOrderHint")}</p>
               </div>
-            </motion.div>
+            </motion.section>
           )}
         </div>
 
-        {/* Order Summary */}
-        <div className="rounded-xl border border-border bg-card p-6">
-          <h3 className="font-heading text-sm font-bold">Order Summary</h3>
-          <div className="mt-3 space-y-2 text-sm">
+        <aside className="h-fit rounded-xl border border-border bg-card p-6 lg:sticky lg:top-20">
+          <h2 className="font-heading text-sm font-bold">{t("store.cart.summary")}</h2>
+          <ul className="mt-3 space-y-3">
             {items.map((item) => (
-              <div key={item.product.id} className="flex justify-between">
-                <span className="text-muted-foreground line-clamp-1">{item.product.name} ×{item.quantity}</span>
-                <span>${(item.product.price * item.quantity).toFixed(2)}</span>
-              </div>
+              <li key={item.key} className="flex gap-3 text-sm">
+                <div className="relative h-12 w-12 shrink-0 overflow-hidden rounded-md bg-muted">
+                  <img src={productImage(item.product.images)} alt="" className="h-full w-full object-cover" />
+                  <span className="absolute -right-1 -top-1 flex h-5 min-w-5 items-center justify-center rounded-full bg-primary px-1 text-[10px] font-bold text-primary-foreground">{item.quantity}</span>
+                </div>
+                <div className="min-w-0 flex-1">
+                  <p className="line-clamp-1 font-medium">{pick(item.product.name, item.product.name_so)}</p>
+                  {Object.keys(item.variants).length > 0 && (
+                    <p className="text-xs text-muted-foreground">{Object.values(item.variants).join(" · ")}</p>
+                  )}
+                </div>
+                <span className="tabular-nums">{formatMoney(item.product.price * item.quantity, currency)}</span>
+              </li>
             ))}
-            <div className="border-t border-border pt-2">
-              <div className="flex justify-between"><span className="text-muted-foreground">Subtotal</span><span>${totalPrice.toFixed(2)}</span></div>
-              <div className="flex justify-between"><span className="text-muted-foreground">Shipping</span><span>${shipping.toFixed(2)}</span></div>
-              <div className="flex justify-between"><span className="text-muted-foreground">Tax</span><span>${tax.toFixed(2)}</span></div>
-            </div>
-            <div className="border-t border-border pt-2 text-base font-bold">
-              <div className="flex justify-between"><span>Total</span><span>${total.toFixed(2)}</span></div>
-            </div>
-          </div>
-        </div>
+          </ul>
+          <OrderTotals className="mt-4 border-t border-border pt-4" subtotal={totals.subtotal} shipping={totals.shipping} tax={totals.tax} total={totals.total} currency={currency} estimated />
+        </aside>
       </div>
     </div>
   );

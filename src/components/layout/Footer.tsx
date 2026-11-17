@@ -1,63 +1,82 @@
 import { Link } from "react-router-dom";
+import { MapPin, Phone } from "lucide-react";
+import { useI18n } from "@/lib/i18n";
+import { useCategories, useStoreSettings } from "@/hooks/store/useCatalog";
+import { formatSomaliPhone, normalizeSomaliPhone } from "@/lib/wallet";
+import PaymentMethods from "@/components/store/PaymentMethods";
+import StoreLogo from "@/components/store/StoreLogo";
 
-const Footer = () => (
-  <footer className="border-t border-border bg-card">
-    <div className="container mx-auto px-4 py-12 lg:px-8">
-      <div className="grid gap-8 md:grid-cols-2 lg:grid-cols-4">
-        {/* Brand */}
-        <div>
-          <Link to="/" className="flex items-center gap-2">
-            <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-gradient-navy">
-              <span className="text-sm font-bold text-primary-foreground">S</span>
-            </div>
-            <span className="font-heading text-xl font-bold">Suuq</span>
-          </Link>
-          <p className="mt-3 text-sm text-muted-foreground">
-            Somalia's premier online marketplace. Quality products, trusted payments, fast delivery.
-          </p>
-          <div className="mt-4 flex gap-2">
-            {["EVC PLUS", "ZAAD", "SAHAL", "JEEP"].map((m) => (
-              <span key={m} className="rounded-md border border-border px-2 py-1 text-[10px] font-semibold text-muted-foreground">{m}</span>
-            ))}
+const Footer = () => {
+  const { t, pick } = useI18n();
+  const { data: settings } = useStoreSettings();
+  const { data: categories } = useCategories();
+  const storeName = settings?.store_name || "Suuq";
+  const phone = settings?.phone ?? null;
+  const telHref = phone ? `tel:+${normalizeSomaliPhone(phone) ?? phone.replace(/[^\d]/g, "")}` : null;
+
+  const shopLinks: [string, string][] = [
+    [t("store.footer.allProducts"), "/products"],
+    ...(categories ?? []).slice(0, 4).map((c) => [pick(c.name, c.name_so), `/products?category=${c.slug}`] as [string, string]),
+    [t("store.nav.deals"), "/products?sale=true"],
+  ];
+  const accountLinks: [string, string][] = [
+    [t("store.nav.myAccount"), "/account"],
+    [t("store.nav.orders"), "/account?tab=orders"],
+    [t("store.nav.wishlist"), "/wishlist"],
+    [t("store.cart.title"), "/cart"],
+  ];
+
+  return (
+    <footer className="border-t border-border bg-card">
+      <div className="container mx-auto px-4 py-12 lg:px-8">
+        <div className="grid gap-8 md:grid-cols-2 lg:grid-cols-4">
+          <div>
+            <StoreLogo name={storeName} />
+            <p className="mt-3 text-sm text-muted-foreground">{t("store.footer.tagline")}</p>
+            <PaymentMethods variant="chips" className="mt-4" />
+          </div>
+
+          <nav aria-label={t("store.footer.shop")}>
+            <h2 className="mb-3 font-heading text-sm font-semibold">{t("store.footer.shop")}</h2>
+            <ul className="space-y-2 text-sm text-muted-foreground">
+              {shopLinks.map(([label, href]) => (
+                <li key={href}><Link to={href} className="transition-colors hover:text-foreground">{label}</Link></li>
+              ))}
+            </ul>
+          </nav>
+
+          <nav aria-label={t("store.footer.account")}>
+            <h2 className="mb-3 font-heading text-sm font-semibold">{t("store.footer.account")}</h2>
+            <ul className="space-y-2 text-sm text-muted-foreground">
+              {accountLinks.map(([label, href]) => (
+                <li key={href}><Link to={href} className="transition-colors hover:text-foreground">{label}</Link></li>
+              ))}
+            </ul>
+          </nav>
+
+          <div>
+            <h2 className="mb-3 font-heading text-sm font-semibold">{t("store.footer.contact")}</h2>
+            <ul className="space-y-2 text-sm text-muted-foreground">
+              {settings?.address && (
+                <li className="flex items-start gap-2"><MapPin className="mt-0.5 h-4 w-4 shrink-0" aria-hidden /> <span className="whitespace-pre-line">{settings.address}</span></li>
+              )}
+              {phone && telHref && (
+                <li className="flex items-center gap-2">
+                  <Phone className="h-4 w-4 shrink-0" aria-hidden />
+                  <a href={telHref} className="transition-colors hover:text-foreground">{formatSomaliPhone(phone) || phone}</a>
+                </li>
+              )}
+              {!settings?.address && !phone && <li>{t("store.footer.contactFallback")}</li>}
+            </ul>
           </div>
         </div>
 
-        {/* Quick Links */}
-        <div>
-          <h4 className="mb-3 font-heading text-sm font-semibold">Quick Links</h4>
-          <ul className="space-y-2 text-sm text-muted-foreground">
-            {[["Shop All", "/products"], ["Electronics", "/products?category=electronics"], ["Fashion", "/products?category=fashion"], ["Deals", "/products?sale=true"]].map(([label, href]) => (
-              <li key={label}><Link to={href} className="transition-colors hover:text-foreground">{label}</Link></li>
-            ))}
-          </ul>
-        </div>
-
-        {/* Customer Service */}
-        <div>
-          <h4 className="mb-3 font-heading text-sm font-semibold">Customer Service</h4>
-          <ul className="space-y-2 text-sm text-muted-foreground">
-            {["Contact Us", "Shipping Info", "Returns & Exchanges", "FAQ"].map((label) => (
-              <li key={label}><a href="#" className="transition-colors hover:text-foreground">{label}</a></li>
-            ))}
-          </ul>
-        </div>
-
-        {/* Contact */}
-        <div>
-          <h4 className="mb-3 font-heading text-sm font-semibold">Contact</h4>
-          <ul className="space-y-2 text-sm text-muted-foreground">
-            <li>Mogadishu, Somalia</li>
-            <li>+252 61 XXX XXXX</li>
-            <li>support@suuq.so</li>
-          </ul>
+        <div className="mt-10 border-t border-border pt-6 text-center text-xs text-muted-foreground">
+          © {new Date().getFullYear()} {storeName}. {t("store.footer.rights")}
         </div>
       </div>
-
-      <div className="mt-10 border-t border-border pt-6 text-center text-xs text-muted-foreground">
-        © 2026 Suuq. All rights reserved.
-      </div>
-    </div>
-  </footer>
-);
+    </footer>
+  );
+};
 
 export default Footer;
