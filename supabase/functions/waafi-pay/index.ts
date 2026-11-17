@@ -2,10 +2,14 @@
 // POST { action: "purchase", order_id, phone, wallet? }
 //      { action: "cash", order_id }
 //      { action: "reverse", order_id, payment_id, reason }
+//      { action: "confirm", order_id, payment_id, transaction_id, reason? }   (manual reconciliation)
 // → PayResponse { ok, status, payment_id, wallet, message, message_en, code, order }
 //
 // Amounts always come from the database. WaafiPay API_PURCHASE is synchronous:
-// the request stays open while the payer approves with their PIN (≤ ~2 min).
+// the request stays open while the payer approves with their PIN (WaafiPay waits
+// up to 5 min; we abort after 120 s). No answer ⇒ code UNKNOWN, payment stays
+// `pending` (retries blocked for PAYMENT_STALE_MINUTES) and staff reconcile it
+// via `confirm` after checking the WaafiPay portal.
 
 import type { SupabaseClient } from "npm:@supabase/supabase-js@2";
 import { audit, getCaller, type Caller } from "../_shared/auth.ts";
@@ -19,20 +23,24 @@ import {
   type GatewayCall,
 } from "../_shared/waafipay.ts";
 import {
+  amountMismatchReason,
   buildDescription,
   buildReferenceId,
   checkPayability,
   checkReversible,
+  classifyPurchaseFailure,
+  CONFIRMABLE_STATUSES,
   formatAmount,
-  gatewayFailureMessage,
   isWallet,
-  NETWORK_TIMEOUT_MESSAGE,
+  normalizeTransactionId,
   PAY_MESSAGES,
+  PAYMENT_STALE_INTERVAL,
   parsePurchaseResponse,
   parseReversalResponse,
   shortRandom,
   type PayCode,
   type PaymentRowStatus,
+  type PurchaseCallResult,
 } from "../_shared/waafipay-logic.ts";
 import { detectWallet, maskPhone, normalizeSomaliPhone, type Wallet, type WalletPrefix } from "../_shared/wallet.ts";
 
@@ -50,6 +58,7 @@ interface PayBody {
   wallet?: unknown;
   payment_id?: unknown;
   reason?: unknown;
+  transaction_id?: unknown;
 }
 
 interface OrderRow {
@@ -149,9 +158,29 @@ async function startPayment(
     p_request_id: args.requestId,
     p_initiated_by: args.initiatedBy,
     p_status: args.status,
+    p_stale_after: PAYMENT_STALE_INTERVAL,
   });
   if (error) throw mapDbError(error) ?? error;
   return data as PaymentRow;
+}
+
+/** Flags an order for staff review (orders.needs_review / review_reason) and audits it. */
+async function flagForReview(
+  admin: SupabaseClient,
+  orderId: string,
+  actorId: string,
+  paymentId: string,
+  reason: string,
+): Promise<void> {
+  const { error } = await admin.from("orders").update({ needs_review: true, review_reason: reason }).eq("id", orderId);
+  if (error) console.error(`[${FN}] flagging order ${orderId} for review failed:`, error.message);
+  await audit(admin, {
+    actor_id: actorId,
+    action: "order.needs_review",
+    entity: "order",
+    entity_id: orderId,
+    details: { payment_id: paymentId, reason },
+  });
 }
 
 async function markPaid(admin: SupabaseClient, orderId: string, actorId: string, paymentId: string): Promise<void> {
@@ -235,8 +264,7 @@ async function purchase(req: Request, caller: Caller, body: PayBody): Promise<Re
   const { data: settings } = await admin.from("store_settings").select("store_name").eq("id", 1).maybeSingle();
 
   let call: GatewayCall | null = null;
-  let networkTimeout = false;
-  let transportError: string | null = null;
+  let callResult: PurchaseCallResult;
   try {
     call = await waafiPurchase(cfg, {
       requestId,
@@ -247,14 +275,19 @@ async function purchase(req: Request, caller: Caller, body: PayBody): Promise<Re
       currency: order.currency || "USD",
       description: buildDescription(settings?.store_name ?? "Botan E-commerce", order.order_number),
     });
+    callResult = { kind: "response", parsed: parsePurchaseResponse(call.raw) };
   } catch (e) {
-    if (e instanceof WaafiNetworkTimeout) networkTimeout = true;
-    else transportError = e instanceof Error ? e.message : String(e);
-    console.error(`[${FN}] gateway call failed ref=${referenceId}:`, networkTimeout ? "network timeout" : transportError);
+    callResult = e instanceof WaafiNetworkTimeout
+      ? { kind: "network_timeout" }
+      : { kind: "transport_error", message: e instanceof Error ? e.message : String(e) };
+    console.error(
+      `[${FN}] gateway call failed ref=${referenceId}:`,
+      callResult.kind === "network_timeout" ? "network timeout" : callResult.message,
+    );
   }
 
   // ---- Approved -----------------------------------------------------------
-  const parsed = call ? parsePurchaseResponse(call.raw) : null;
+  const parsed = callResult.kind === "response" ? callResult.parsed : null;
   if (call && parsed?.outcome === "approved") {
     const { error: uErr } = await admin
       .from("payments")
@@ -269,10 +302,14 @@ async function purchase(req: Request, caller: Caller, body: PayBody): Promise<Re
       .eq("id", payment.id);
     if (uErr) console.error(`[${FN}] payment update failed:`, uErr.message);
 
+    // Money was taken: always record + mark paid, even if the amount looks wrong.
     await markPaid(admin, order.id, caller.user.id, payment.id);
 
-    const amountMismatch = parsed.txAmount !== null && Math.abs(parsed.txAmount - Number(amount)) > 0.005;
-    if (amountMismatch) console.warn(`[${FN}] txAmount ${parsed.txAmount} != ${amount} for ${referenceId}`);
+    const mismatch = amountMismatchReason(payment.amount ?? amount, parsed.txAmount);
+    if (mismatch) {
+      console.warn(`[${FN}] ${mismatch} ref=${referenceId}`);
+      await flagForReview(admin, order.id, caller.user.id, payment.id, mismatch);
+    }
     await audit(admin, {
       actor_id: caller.user.id,
       action: "payment.approved",
@@ -283,7 +320,7 @@ async function purchase(req: Request, caller: Caller, body: PayBody): Promise<Re
         wallet,
         amount,
         transaction_id: parsed.transactionId,
-        ...(amountMismatch ? { tx_amount_mismatch: parsed.txAmount } : {}),
+        ...(mismatch ? { tx_amount_mismatch: parsed.txAmount, review_reason: mismatch } : {}),
       },
     });
 
@@ -298,67 +335,54 @@ async function purchase(req: Request, caller: Caller, body: PayBody): Promise<Re
     });
   }
 
-  // ---- Failed / declined / timed out ---------------------------------------
-  let status: PaymentRowStatus;
-  let code: PayCode;
-  let msg: { so: string; en: string };
-  let responseCode: string | null;
-  let responseMsg: string | null;
-  if (parsed && call) {
-    status = parsed.status;
-    code = parsed.code ?? "DECLINED";
-    msg = gatewayFailureMessage(parsed);
-    responseCode = parsed.responseCode;
-    responseMsg = parsed.responseMsg;
-  } else if (networkTimeout) {
-    status = "failed";
-    code = "TIMEOUT";
-    msg = NETWORK_TIMEOUT_MESSAGE;
-    responseCode = "TIMEOUT";
-    responseMsg = "No gateway response before client timeout — verify in WaafiPay portal";
-  } else {
-    status = "failed";
-    code = "GATEWAY_ERROR";
-    msg = PAY_MESSAGES.GATEWAY_ERROR;
-    responseCode = "GATEWAY_ERROR";
-    responseMsg = (transportError ?? "Unknown transport error").slice(0, 500);
-  }
+  // ---- Failed / cancelled / unknown ----------------------------------------
+  // Only an explicit gateway answer is final; no answer keeps the payment pending (UNKNOWN).
+  const outcome = classifyPurchaseFailure(callResult);
 
   const { error: fErr } = await admin
     .from("payments")
     .update({
-      status,
-      response_code: responseCode,
-      response_msg: responseMsg,
+      status: outcome.status,
+      response_code: outcome.responseCode,
+      response_msg: outcome.responseMsg,
       raw_response: call?.safe ?? null,
       transaction_id: parsed?.transactionId ?? null,
     })
-    .eq("id", payment.id);
+    .eq("id", payment.id)
+    .in("status", ["initiated", "pending"]);
   if (fErr) console.error(`[${FN}] payment update failed:`, fErr.message);
 
-  const { error: oErr } = await admin
-    .from("orders")
-    .update({ payment_status: "failed" })
-    .eq("id", order.id)
-    .eq("payment_status", "pending");
-  if (oErr) console.error(`[${FN}] order update failed:`, oErr.message);
+  if (outcome.orderPaymentStatus === "failed") {
+    const { error: oErr } = await admin
+      .from("orders")
+      .update({ payment_status: "failed" })
+      .eq("id", order.id)
+      .eq("payment_status", "pending");
+    if (oErr) console.error(`[${FN}] order update failed:`, oErr.message);
+  }
 
   await audit(admin, {
     actor_id: caller.user.id,
-    action: "payment.failed",
+    action: outcome.code === "UNKNOWN" ? "payment.unknown" : "payment.failed",
     entity: "payment",
     entity_id: payment.id,
-    details: { order_id: order.id, wallet, code, response_code: responseCode, response_msg: responseMsg },
+    details: {
+      order_id: order.id,
+      wallet,
+      code: outcome.code,
+      response_code: outcome.responseCode,
+      response_msg: outcome.responseMsg,
+    },
   });
 
   return json(req, {
     ok: false,
-    status,
+    status: outcome.status,
     payment_id: payment.id,
     wallet,
-    code,
-    message: msg.so,
-    message_en: msg.en,
+    code: outcome.code,
+    message: outcome.message.so,
+    message_en: outcome.message.en,
     order: await freshOrder(admin, order.id),
   });
 }
@@ -456,9 +480,9 @@ async function reverse(req: Request, caller: Caller, body: PayBody): Promise<Res
         status: payment.status,
         payment_id: payment.id,
         wallet: payment.wallet ?? undefined,
-        code: e instanceof WaafiNetworkTimeout ? "TIMEOUT" : "GATEWAY_ERROR",
-        message: PAY_MESSAGES.GATEWAY_ERROR.so,
-        message_en: `${PAY_MESSAGES.GATEWAY_ERROR.en} (${m})`,
+        code: e instanceof WaafiNetworkTimeout ? "UNKNOWN" : "GATEWAY_ERROR",
+        message: "Jawaab lagama helin WaafiPay celinta. Hubi WaafiPay portal-ka ka hor intaadan mar kale isku dayin.",
+        message_en: `No answer from WaafiPay for the reversal (${m}). Check the WaafiPay portal before retrying.`,
         order: await freshOrder(admin, order.id),
       });
     }
@@ -528,6 +552,128 @@ async function reverse(req: Request, caller: Caller, body: PayBody): Promise<Res
 }
 
 // ---------------------------------------------------------------------------
+// confirm (manual reconciliation after checking the WaafiPay portal)
+// ---------------------------------------------------------------------------
+
+async function confirm(req: Request, caller: Caller, body: PayBody): Promise<Response> {
+  const { admin } = caller;
+  if (!(await caller.can("payments.refund"))) throw payError(403, "FORBIDDEN");
+  if (!isUuid(body.order_id) || !isUuid(body.payment_id)) throw payError(400, "BAD_REQUEST");
+  const transactionId = normalizeTransactionId(body.transaction_id);
+  if (!transactionId) {
+    throw payError(400, "BAD_REQUEST", {
+      so: "Transaction ID-ga WaafiPay waa khalad (ugu badnaan 64 xaraf: A-Z, 0-9, . _ -).",
+      en: "A valid WaafiPay transaction id is required (max 64 chars: A-Z, 0-9, . _ -).",
+    });
+  }
+  const reason = (typeof body.reason === "string" ? body.reason.trim() : "").slice(0, 200);
+
+  const order = await loadOrder(admin, body.order_id);
+  if (
+    order.payment_status === "paid" ||
+    order.payment_status === "refunded" ||
+    order.status === "cancelled" ||
+    order.status === "refunded"
+  ) {
+    throw payError(409, "ORDER_NOT_PAYABLE");
+  }
+
+  const { data: pData, error: pErr } = await admin
+    .from("payments")
+    .select("id, order_id, provider, wallet, account_no, amount, status, reference_id, transaction_id, created_at, raw_response")
+    .eq("id", body.payment_id)
+    .eq("order_id", order.id)
+    .maybeSingle();
+  if (pErr) throw pErr;
+  if (!pData) throw payError(404, "NOT_FOUND", { so: "Lacag-bixinta lama helin.", en: "Payment not found." });
+  const payment = pData as PaymentRow;
+  if (payment.provider !== "waafipay" || !CONFIRMABLE_STATUSES.includes(payment.status)) {
+    throw payError(409, "ORDER_NOT_PAYABLE", {
+      so: "Lacag-bixintan gacan laguma xaqiijin karo (waa inay ahaataa WaafiPay oo sugaysa ama fashilantay).",
+      en: "Only a pending/failed WaafiPay payment can be confirmed manually.",
+    });
+  }
+
+  // No other approved payment, no other attempt still in flight, transaction id not reused.
+  const { data: others, error: oErr } = await admin
+    .from("payments")
+    .select("id, status, transaction_id")
+    .eq("order_id", order.id)
+    .neq("id", payment.id)
+    .in("status", ["approved", "initiated", "pending"]);
+  if (oErr) throw oErr;
+  if ((others ?? []).some((p: { status: string }) => p.status === "approved")) throw payError(409, "ORDER_NOT_PAYABLE");
+  if ((others ?? []).length > 0) throw payError(409, "PAYMENT_IN_PROGRESS");
+  const { data: dup, error: dErr } = await admin
+    .from("payments")
+    .select("id")
+    .eq("provider", "waafipay")
+    .eq("transaction_id", transactionId)
+    .neq("id", payment.id)
+    .limit(1);
+  if (dErr) throw dErr;
+  if ((dup ?? []).length > 0) {
+    throw payError(409, "ORDER_NOT_PAYABLE", {
+      so: "Transaction ID-gan horay ayaa loogu isticmaalay lacag-bixin kale.",
+      en: "This transaction id is already linked to another payment.",
+    });
+  }
+
+  const who = caller.profile.full_name?.trim() || caller.user.id;
+  const responseMsg = `Confirmed manually by ${who}${reason ? `: ${reason}` : ""}`.slice(0, 500);
+  const { data: updated, error: uErr } = await admin
+    .from("payments")
+    .update({
+      status: "approved",
+      transaction_id: transactionId,
+      response_code: "MANUAL",
+      response_msg: responseMsg,
+      raw_response: {
+        ...(payment.raw_response ?? {}),
+        manual_confirm: {
+          by: caller.user.id,
+          at: new Date().toISOString(),
+          previous_status: payment.status,
+          transaction_id: transactionId,
+          reason: reason || null,
+        },
+      },
+    })
+    .eq("id", payment.id)
+    .in("status", [...CONFIRMABLE_STATUSES])
+    .select("id")
+    .maybeSingle();
+  if (uErr) throw uErr;
+  if (!updated) throw payError(409, "ORDER_NOT_PAYABLE"); // lost a race with another update
+
+  await markPaid(admin, order.id, caller.user.id, payment.id);
+  await audit(admin, {
+    actor_id: caller.user.id,
+    action: "payment.manual_confirm",
+    entity: "payment",
+    entity_id: payment.id,
+    details: {
+      order_id: order.id,
+      wallet: payment.wallet,
+      amount: payment.amount,
+      transaction_id: transactionId,
+      previous_status: payment.status,
+      reason: reason || null,
+    },
+  });
+
+  return json(req, {
+    ok: true,
+    status: "approved",
+    payment_id: payment.id,
+    wallet: payment.wallet ?? undefined,
+    message: PAY_MESSAGES.MANUAL_CONFIRMED.so,
+    message_en: PAY_MESSAGES.MANUAL_CONFIRMED.en,
+    order: await freshOrder(admin, order.id),
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -535,7 +681,11 @@ Deno.serve(async (req) => {
   const preflight = handleCors(req);
   if (preflight) return preflight;
   if (req.method !== "POST") {
-    return json(req, { ok: false, status: "failed", code: "BAD_REQUEST", message: "Method not allowed" }, 405);
+    return json(
+      req,
+      { ok: false, status: "failed", code: "BAD_REQUEST", message: "Habka codsiga lama ogola.", message_en: "Method not allowed" },
+      405,
+    );
   }
   try {
     const caller = await getCaller(req);
@@ -547,6 +697,8 @@ Deno.serve(async (req) => {
         return await cash(req, caller, body);
       case "reverse":
         return await reverse(req, caller, body);
+      case "confirm":
+        return await confirm(req, caller, body);
       default:
         throw payError(400, "BAD_REQUEST", { so: "Ficil aan la aqoon.", en: "Unknown action." });
     }

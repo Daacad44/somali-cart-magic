@@ -36,6 +36,8 @@ export interface StoreSettings {
   phone: string | null;
   address: string | null;
   receipt_footer: string | null;
+  /** Max discount (fraction of subtotal, e.g. 0.2 = 20%) for cashiers without orders.manage. */
+  max_cashier_discount_pct: number;
   updated_at: string;
 }
 
@@ -127,6 +129,9 @@ export interface Order {
   notes: string | null;
   paid_at: string | null;
   cancelled_at: string | null;
+  /** Set by the server when something needs a human look (e.g. late approval on a cancelled order). */
+  needs_review: boolean;
+  review_reason: string | null;
   created_at: string;
   updated_at: string;
   customer?: Pick<Customer, "id" | "full_name" | "phone"> | null;
@@ -145,6 +150,8 @@ export interface OrderItem {
   quantity: number;
   variants: Record<string, string>;
   line_total: number;
+  /** Units actually deducted from stock for this line. */
+  stock_deducted: number;
 }
 
 export interface Payment {
@@ -196,20 +203,25 @@ export interface DashboardStats {
 
 /** Body/response contract of the `waafi-pay` edge function. */
 export interface PayRequest {
-  action: "purchase" | "reverse" | "cash";
+  action: "purchase" | "reverse" | "cash" | "confirm";
   order_id: string;
   phone?: string;          // purchase
   wallet?: Wallet;         // optional override (staff only)
-  payment_id?: string;     // reverse
-  reason?: string;
+  payment_id?: string;     // reverse | confirm
+  reason?: string;         // reverse (required) | confirm (note)
+  transaction_id?: string; // confirm: WaafiPay transaction id verified in the merchant portal
 }
 export interface PayResponse {
   ok: boolean;
   status: PaymentRowStatus;
   payment_id?: string;
   wallet?: Wallet | "CASH";
-  message: string;         // human readable (Somali/English)
-  code?: string;           // machine code, e.g. WALLET_NOT_DETECTED, TIMEOUT, DECLINED
+  message: string;         // Somali
+  message_en?: string;     // English
+  // WALLET_NOT_DETECTED, INVALID_PHONE, ORDER_NOT_PAYABLE, FORBIDDEN, DECLINED, CANCELLED, TIMEOUT,
+  // UNKNOWN (gateway didn't answer in time: payment stays pending, retry blocked until PAYMENT_STALE_MINUTES),
+  // PAYMENT_IN_PROGRESS, GATEWAY_ERROR, NOT_CONFIGURED, NOT_REVERSIBLE, NOT_FOUND, BAD_REQUEST, UNAUTHORIZED, NETWORK
+  code?: string;
   order?: Order;
 }
 
@@ -227,3 +239,8 @@ export interface AdminUser extends Profile {
   permissions: string[];
   last_sign_in_at: string | null;
 }
+
+/** A pending payment older than this (minutes) is considered stale: WaafiPay gives the
+ * payer 5 minutes to approve, so after 6 minutes a late approval can no longer happen.
+ * Must match the SQL interval in start_payment / cancel_order. */
+export const PAYMENT_STALE_MINUTES = 6;

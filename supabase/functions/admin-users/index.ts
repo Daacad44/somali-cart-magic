@@ -10,13 +10,17 @@
 //    deactivate or demote themself (owner role is never assignable here).
 //  * Only the owner can create admins or modify existing admins.
 //  * Nobody can change their own role, permissions or active flag.
-//  * Non owner/admin callers (staff with users.manage) can only grant
-//    permissions they hold themselves.
+//  * Non owner/admin callers (staff with users.manage) can never change roles,
+//    can only create/modify `staff` users whose current (and newly granted)
+//    permissions are a subset of their own — so no customers, admins or owner,
+//    and customer password resets are owner/admin only.
+//  Rules live in ../_shared/user-guard.ts (pure, unit-tested).
 
 import type { SupabaseClient, User } from "npm:@supabase/supabase-js@2";
 import { audit, getCaller, type Caller, type Role } from "../_shared/auth.ts";
 import { handleCors } from "../_shared/cors.ts";
 import { errorResponse, HttpError, isUuid, json, readJson } from "../_shared/http.ts";
+import { checkUserMutation, isPrivileged, type GuardActor, type UserMutation } from "../_shared/user-guard.ts";
 
 const FN = "admin-users";
 const MANAGEABLE_ROLES = ["admin", "staff", "customer"] as const;
@@ -108,7 +112,7 @@ async function allPermissionKeys(admin: SupabaseClient): Promise<string[]> {
   return (data ?? []).map((r: { key: string }) => r.key);
 }
 
-/** Validates + de-duplicates requested permission keys, enforcing the "grant only what you hold" rule. */
+/** Validates + de-duplicates requested permission keys (the "grant only what you hold" rule is in the guard). */
 async function validatePermissions(caller: Caller, raw: unknown): Promise<string[]> {
   if (raw === undefined || raw === null) return [];
   if (!Array.isArray(raw) || raw.some((p) => typeof p !== "string")) {
@@ -119,13 +123,6 @@ async function validatePermissions(caller: Caller, raw: unknown): Promise<string
   const unknown = requested.filter((p) => !valid.has(p));
   if (unknown.length) {
     throw err(400, "INVALID_PERMISSION", `Ogolaansho aan jirin: ${unknown.join(", ")}`, `Unknown permissions: ${unknown.join(", ")}`);
-  }
-  if (caller.profile.role !== "owner" && caller.profile.role !== "admin") {
-    for (const p of requested) {
-      if (!(await caller.can(p))) {
-        throw forbidden(`Ma bixin kartid ogolaansho aadan adigu haysan: ${p}`, `You cannot grant a permission you don't hold: ${p}`);
-      }
-    }
   }
   return requested;
 }
@@ -147,30 +144,26 @@ async function toAdminUser(admin: SupabaseClient, id: string): Promise<AdminUser
   return { ...profile, permissions: perms.get(id) ?? [], last_sign_in_at: data?.user?.last_sign_in_at ?? null };
 }
 
-/**
- * Central guard for every mutation on an existing user.
- * `change` describes what the request touches.
- */
-function assertCanModify(
-  caller: Caller,
-  target: ProfileRow,
-  change: { role?: ManageableRole; permissions?: boolean; active?: boolean },
-): void {
-  const self = caller.user.id === target.id;
-  const callerRole = caller.profile.role;
+/** The caller as seen by the guard (staff permissions loaded from user_permissions). */
+async function guardActor(caller: Caller): Promise<GuardActor> {
+  const role = caller.profile.role;
+  const permissions = isPrivileged(role) ? [] : (await permissionsFor(caller.admin, [caller.user.id])).get(caller.user.id) ?? [];
+  return { id: caller.user.id, role, permissions };
+}
 
-  if (target.role === "owner" && !self) {
-    throw forbidden("Qofna wax kama beddeli karo milkiilaha.", "Only the owner can modify the owner account.");
-  }
-  if (self && (change.role !== undefined || change.permissions || change.active !== undefined)) {
-    throw forbidden(
-      "Ma beddeli kartid doorkaaga, ogolaanshahaaga ama xaaladdaada.",
-      "You cannot change your own role, permissions or active status.",
-    );
-  }
-  if ((target.role === "admin" || change.role === "admin") && callerRole !== "owner" && !self) {
-    throw forbidden("Kaliya milkiilaha ayaa maamuli kara admin-nada.", "Only the owner can create or modify admins.");
-  }
+/**
+ * Central guard for every mutation (see ../_shared/user-guard.ts).
+ * Returns the target's current permissions for callers that need them.
+ */
+async function assertAllowed(caller: Caller, target: ProfileRow | null, mutation: UserMutation): Promise<string[]> {
+  const targetPerms = target ? (await permissionsFor(caller.admin, [target.id])).get(target.id) ?? [] : [];
+  const denial = checkUserMutation(
+    await guardActor(caller),
+    target ? { id: target.id, role: target.role, permissions: targetPerms } : null,
+    mutation,
+  );
+  if (denial) throw forbidden(denial.so, denial.en);
+  return targetPerms;
 }
 
 function ok(req: Request, user: AdminUser, so: string, en: string): Response {
@@ -223,11 +216,9 @@ async function createUser(req: Request, caller: Caller, body: Body): Promise<Res
   if (!fullName) throw bad("Magaca waa loo baahan yahay.", "full_name is required.");
   const phone = optString(body.phone, "phone", 32) || null;
   const role = validateRole(body.role);
-  if (role === "admin" && caller.profile.role !== "owner") {
-    throw forbidden("Kaliya milkiilaha ayaa abuuri kara admin.", "Only the owner can create admins.");
-  }
-  // Permissions only matter for staff; validate before creating the auth user.
+  // Permissions only matter for staff; validate + authorize before creating the auth user.
   const perms = role === "staff" ? await validatePermissions(caller, body.permissions) : [];
+  await assertAllowed(caller, null, { action: "create", role, permissions: perms });
 
   const { data, error } = await admin.auth.admin.createUser({
     email,
@@ -277,7 +268,7 @@ async function updateUser(req: Request, caller: Caller, body: Body): Promise<Res
   const role = body.role === undefined || body.role === null ? undefined : validateRole(body.role);
   const roleChange = role !== undefined && role !== target.role ? role : undefined;
 
-  assertCanModify(caller, target, { role: roleChange });
+  await assertAllowed(caller, target, { action: "update", roleChange });
 
   const patch: Record<string, unknown> = {};
   if (fullName !== undefined) {
@@ -329,21 +320,11 @@ async function setPermissions(req: Request, caller: Caller, body: Body): Promise
   const userId = reqUserId(body);
   if (!Array.isArray(body.permissions)) throw bad("Ogolaanshaha waa khalad.", "permissions must be an array.");
   const target = await loadProfile(admin, userId);
-  assertCanModify(caller, target, { permissions: true });
+  const perms = await validatePermissions(caller, body.permissions);
+  const before = await assertAllowed(caller, target, { action: "set_permissions", permissions: perms });
   if (target.role !== "staff") {
     throw err(400, "NOT_STAFF", "Ogolaanshaha gaarka ah waxay khuseeyaan shaqaalaha oo keliya.",
       "Granular permissions only apply to staff (owner/admin already have all).");
-  }
-  const perms = await validatePermissions(caller, body.permissions);
-
-  const before = (await permissionsFor(admin, [userId])).get(userId) ?? [];
-  // Non owner/admin callers may not revoke permissions they don't hold either.
-  if (caller.profile.role !== "owner" && caller.profile.role !== "admin") {
-    for (const p of before.filter((x) => !perms.includes(x))) {
-      if (!(await caller.can(p))) {
-        throw forbidden(`Ma qaadi kartid ogolaansho aadan adigu haysan: ${p}`, `You cannot revoke a permission you don't hold: ${p}`);
-      }
-    }
   }
   await replacePermissions(admin, userId, perms, caller.user.id);
 
@@ -366,7 +347,7 @@ async function setActive(req: Request, caller: Caller, body: Body): Promise<Resp
   if (typeof body.is_active !== "boolean") throw bad("is_active waa khalad.", "is_active must be a boolean.");
   const active = body.is_active;
   const target = await loadProfile(admin, userId);
-  assertCanModify(caller, target, { active });
+  await assertAllowed(caller, target, { action: "set_active", active });
 
   const { error } = await admin.from("profiles").update({ is_active: active }).eq("id", userId);
   if (error) throw error;
@@ -397,7 +378,7 @@ async function resetPassword(req: Request, caller: Caller, body: Body): Promise<
   const userId = reqUserId(body);
   const password = validatePassword(body.password);
   const target = await loadProfile(admin, userId);
-  assertCanModify(caller, target, {});
+  await assertAllowed(caller, target, { action: "reset_password" });
 
   const { error } = await admin.auth.admin.updateUserById(userId, { password });
   if (error) throw err(400, "RESET_FAILED", `Password-ka lama beddeli karo: ${error.message}`, error.message);

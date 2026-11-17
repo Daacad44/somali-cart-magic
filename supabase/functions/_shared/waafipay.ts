@@ -5,8 +5,8 @@ import {
   buildMockPurchaseResponse,
   formatWaafiTimestamp,
   mockOutcomeFor,
+  resolveWaafiEndpoint,
   stripCredentials,
-  WAAFI_ENDPOINTS,
   type WaafiEnv,
   type WaafiRawResponse,
 } from "./waafipay-logic.ts";
@@ -40,7 +40,7 @@ export class WaafiTransportError extends Error {
 export const PURCHASE_TIMEOUT_MS = 120_000;
 export const REVERSAL_TIMEOUT_MS = 30_000;
 
-/** Loads config from env. Returns null when live credentials are missing (NOT_CONFIGURED). */
+/** Loads config from env. Returns null when live credentials are missing or WAAFI_BASE_URL is invalid (NOT_CONFIGURED). */
 export function loadWaafiConfig(): WaafiConfig | null {
   const mode = (Deno.env.get("WAAFI_MODE") ?? "live").toLowerCase() === "mock" ? "mock" : "live";
   const env: WaafiEnv = (Deno.env.get("WAAFI_ENV") ?? "sandbox").toLowerCase() === "production" ? "production" : "sandbox";
@@ -48,7 +48,15 @@ export function loadWaafiConfig(): WaafiConfig | null {
   const apiUserId = Deno.env.get("WAAFI_API_USER_ID") ?? "";
   const apiKey = Deno.env.get("WAAFI_API_KEY") ?? "";
   if (mode === "live" && (!merchantUid || !apiUserId || !apiKey)) return null;
-  return { mode, env, endpoint: WAAFI_ENDPOINTS[env], merchantUid, apiUserId, apiKey };
+  // WAAFI_BASE_URL overrides the default host (e.g. if WaafiPay issues a different sandbox URL).
+  let endpoint: string;
+  try {
+    endpoint = resolveWaafiEndpoint(env, Deno.env.get("WAAFI_BASE_URL"));
+  } catch (e) {
+    console.error("[waafipay] invalid WAAFI_BASE_URL:", e instanceof Error ? e.message : e);
+    return null;
+  }
+  return { mode, env, endpoint, merchantUid, apiUserId, apiKey };
 }
 
 export interface PurchaseInput {

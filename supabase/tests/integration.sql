@@ -254,9 +254,54 @@ begin
     perform cancel_order(o.id);
     assert false, 'fresh in-flight payment blocks cancel';
   exception when raise_exception then assert sqlerrm like '%PAYMENT_IN_PROGRESS%', 'blocked'; end;
-  update payments set created_at = now() - interval '5 minutes' where reference_id = 'T-9';
+  update payments set created_at = now() - interval '7 minutes' where reference_id = 'T-9';
   o := cancel_order(o.id, 'stuck');
   assert o.status = 'cancelled' and o.payment_status = 'failed', 'stuck order cancelled';
+end $$;
+
+-- ---------- review fixes: discount cap, fulfilment rules, stock shortage ----------
+reset role;
+do $$
+declare o orders; p products; s0 int;
+begin
+  -- cashier (no orders.manage) is capped at 20% discount
+  perform set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-0000000000c1', true);
+  perform set_config('request.jwt.claim.role', 'authenticated', true);
+  select * into p from products where slug = 'modern-coffee-table';   -- 299.99
+  begin
+    perform create_order(jsonb_build_array(jsonb_build_object('product_id', p.id, 'quantity', 1)), '{}'::jsonb, 'pos', null, 100);
+    assert false, 'cashier discount above cap must fail';
+  exception when raise_exception then assert sqlerrm like '%DISCOUNT_TOO_HIGH%', 'discount code'; end;
+  o := create_order(jsonb_build_array(jsonb_build_object('product_id', p.id, 'quantity', 1)), '{}'::jsonb, 'pos', null, 59.99);
+  assert o.discount = 59.99, 'discount within cap ok';
+
+  -- same product on two variant lines: aggregated stock check
+  begin
+    perform create_order(jsonb_build_array(
+      jsonb_build_object('product_id', p.id, 'quantity', p.stock, 'variants', '{"Wood":"Oak"}'::jsonb),
+      jsonb_build_object('product_id', p.id, 'quantity', 1, 'variants', '{"Wood":"Walnut"}'::jsonb)), '{}'::jsonb, 'pos');
+    assert false, 'aggregated stock must fail';
+  exception when raise_exception then assert sqlerrm like 'OUT_OF_STOCK:%', 'aggregated oos'; end;
+
+  -- owner: fulfilment only on paid orders, no cancel via status
+  perform set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-0000000000a1', true);
+  begin
+    perform update_order_status(o.id, 'shipped');
+    assert false, 'unpaid order cannot ship';
+  exception when raise_exception then assert sqlerrm like '%ORDER_NOT_PAID%', 'not paid code'; end;
+  begin
+    perform update_order_status(o.id, 'cancelled');
+    assert false, 'cancel via status not allowed';
+  exception when raise_exception then assert sqlerrm like '%INVALID_STATUS%', 'invalid status code'; end;
+
+  -- stock shortage at payment time is flagged, refund restocks only what was taken
+  update products set stock = 0 where id = p.id;
+  perform set_config('request.jwt.claim.role', 'service_role', true);
+  o := mark_order_paid(o.id);
+  assert o.needs_review and o.review_reason like 'STOCK_SHORT%', 'shortage flagged';
+  assert (select stock from products where id = p.id) = 0, 'stock not negative';
+  perform refund_order(o.id);
+  assert (select stock from products where id = p.id) = 0, 'refund restocks only deducted qty';
 end $$;
 
 reset role;
