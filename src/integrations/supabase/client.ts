@@ -48,6 +48,9 @@ export function rpcErrorMessage(err: unknown, lang: "so" | "en" = "so"): string 
     ORDER_ALREADY_PAID: ["Dalabkan horay ayaa loo bixiyay.", "This order is already paid."],
     PAYMENT_IN_PROGRESS: ["Lacag-bixin ayaa socota.", "A payment is in progress."],
     ORDER_NOT_FOUND: ["Dalabka lama helin.", "Order not found."],
+    ORDER_NOT_PAID: ["Dalabka weli lama bixin; xaaladda lama beddeli karo.", "This order isn't paid yet, so its status can't change."],
+    INVALID_TRANSITION: ["Xaaladdan looma beddeli karo dalabkan.", "This status change isn't allowed for this order."],
+    DISCOUNT_TOO_HIGH: ["Qiimo-dhimistu waxay dhaaftay xadka laguu oggol yahay.", "The discount exceeds your allowed limit."],
   };
   if (raw.startsWith("OUT_OF_STOCK:")) {
     const name = raw.split(":").slice(1).join(":");

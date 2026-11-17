@@ -2,11 +2,12 @@ import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "r
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
-  AlertTriangle, Banknote, BarChart3, Loader2, Printer, Save, ShoppingCart, Smartphone, X,
+  AlertTriangle, Banknote, BarChart3, Loader2, Lock, Printer, Save, ShoppingCart, Smartphone, X,
 } from "lucide-react";
 import { supabase, rpcErrorMessage } from "@/integrations/supabase/client";
 import type { Order } from "@/integrations/supabase/types";
 import { payOrder, subscribeToOrderPayments } from "@/lib/payments";
+import { PAYMENT_STALE_MS, serverPayMessage } from "@/lib/payment-state";
 import { formatSomaliPhone, normalizeSomaliPhone, type Wallet } from "@/lib/wallet";
 import { useAuth } from "@/lib/auth";
 import { useI18n } from "@/lib/i18n";
@@ -15,7 +16,7 @@ import {
   type PosCustomer, type PosProduct,
 } from "@/hooks/pos";
 import {
-  addLine, clampDiscount, computeTotals, hasVariants, initialPayState, isBusy, isTicketLocked, payReducer,
+  addLine, clampDiscount, computeTotals, hasVariants, initialPayState, isBusy, isTicketLocked, maxDiscountFor, payReducer,
   remainingStock, removeLine, setLineQty, toRpcItems, validateSale,
   type PayMethod, type SaleError, type TicketLine, type Variants,
 } from "@/components/pos/ticket";
@@ -31,6 +32,7 @@ import { Kbd } from "@/components/pos/Kbd";
 import { printReceipt } from "@/components/receipt/Receipt";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
@@ -53,7 +55,10 @@ function overlayOpen(): boolean {
 
 const AdminPos = () => {
   const { t, lang, formatMoney } = useI18n();
-  const { user, profile } = useAuth();
+  const { user, profile, can } = useAuth();
+  // Without payments.initiate the server refuses every payment (wallet or cash), so a sale can't be saved.
+  const canTakePayments = can("payments.initiate");
+  const canManageOrders = can("orders.manage");
   const qc = useQueryClient();
 
   const productsQ = usePosProducts();
@@ -96,8 +101,13 @@ const AdminPos = () => {
   const order = state.order;
 
   const rawSubtotal = useMemo(() => computeTotals(lines, 0, 0).subtotal, [lines]);
-  const discount = clampDiscount(discountInput, rawSubtotal);
-  const discountClamped = discountInput.trim() !== "" && parseFloat(discountInput.replace(",", ".")) > rawSubtotal;
+  // Total must stay > 0; cashiers without orders.manage are capped at max_cashier_discount_pct of the subtotal.
+  const maxDiscountPct = Number(settings.max_cashier_discount_pct ?? 0.2);
+  const maxDiscount = maxDiscountFor(rawSubtotal, { canManage: canManageOrders, maxPct: maxDiscountPct });
+  const discount = clampDiscount(discountInput, rawSubtotal, maxDiscount);
+  const typedDiscount = parseFloat(discountInput.replace(",", "."));
+  const discountClamped = discountInput.trim() !== "" && Number.isFinite(typedDiscount) && typedDiscount > maxDiscount;
+  const discountPctLabel = +(Math.min(Math.max(maxDiscountPct, 0), 1) * 100).toFixed(2);
   const totals = useMemo(() => computeTotals(lines, discount, settings.tax_rate), [lines, discount, settings.tax_rate]);
   // Once the order exists the server's numbers are the truth.
   const shown = order
@@ -190,16 +200,23 @@ const AdminPos = () => {
     const s = stateRef.current;
     if (isBusy(s)) return;
     const m = opts.method ?? method;
+    if (!canTakePayments) {
+      toast.error(t("pos.noPay.title"));
+      return;
+    }
     const errors = validateSale({
       lines,
       method: m,
       normalizedPhone: det.normalized,
       detectedWallet: det.detected?.wallet ?? null,
       overrideWallet: override,
+      discount,
+      maxDiscount,
     });
     if (errors.length) {
       toast.error(validationMessage(errors[0]));
       if (errors[0] === "EMPTY_TICKET") searchRef.current?.focus();
+      else if (errors[0] === "DISCOUNT_TOO_HIGH") document.getElementById("pos-discount")?.focus();
       else if (errors[0] !== "INVALID_QUANTITY") phoneRef.current?.focus();
       return;
     }
@@ -252,9 +269,15 @@ const AdminPos = () => {
       if (res.ok && (res.status === "approved" || res.order?.payment_status === "paid")) {
         await finalizeApproved(current.id, print);
       } else if (finalized.current !== current.id) {
+        // UNKNOWN (or a bare 'pending'): no gateway answer, the attempt stays pending until it goes stale.
+        const noAnswer = res.code === "UNKNOWN" || (!res.code && res.status === "pending");
         dispatch({
           type: "PAY_FAILED",
-          error: { code: res.code ?? (res.status === "pending" ? "TIMEOUT" : "DECLINED"), message: res.message },
+          error: {
+            code: res.code ?? (res.status === "pending" ? "UNKNOWN" : "DECLINED"),
+            message: serverPayMessage(res, lang),
+            ...(noAnswer ? { retryAt: (stateRef.current.attempt?.startedAt ?? Date.now()) + PAYMENT_STALE_MS } : {}),
+          },
         });
         setFailedOpen(true);
       }
@@ -262,7 +285,8 @@ const AdminPos = () => {
       inFlight.current = false;
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [method, lines, det.normalized, det.detected, det.effective, override, customer, notes, discount, lang, finalizeApproved]);
+  }, [method, lines, det.normalized, det.detected, det.effective, override, customer, notes, discount, maxDiscount,
+    canTakePayments, lang, finalizeApproved]);
 
   const checkStatus = useCallback(async () => {
     const s = stateRef.current;
@@ -384,7 +408,7 @@ const AdminPos = () => {
   /* -------------------------------- view -------------------------------- */
 
   const dialogOpen = busy || (state.phase === "failed" && failedOpen);
-  const canSubmit = !busy && lines.length > 0;
+  const canSubmit = !busy && lines.length > 0 && canTakePayments;
   const variantAvailable = variantProduct ? remainingStock(lines, variantProduct) : 0;
 
   return (
@@ -480,9 +504,17 @@ const AdminPos = () => {
                     className="h-11 tabular-nums"
                     aria-describedby="pos-discount-hint"
                   />
-                  {discountClamped && (
-                    <p id="pos-discount-hint" className="text-[11px] text-warning">{t("pos.ticket.discountClamped")}</p>
-                  )}
+                  {discountClamped ? (
+                    <p id="pos-discount-hint" className="text-[11px] text-warning">
+                      {!canManageOrders && discountPctLabel < 100
+                        ? t("pos.ticket.discountLimitHit", { amount: formatMoney(maxDiscount, currency), pct: discountPctLabel })
+                        : t("pos.ticket.discountClamped")}
+                    </p>
+                  ) : !canManageOrders && lines.length > 0 ? (
+                    <p id="pos-discount-hint" className="text-[11px] text-muted-foreground">
+                      {t("pos.ticket.discountLimit", { pct: discountPctLabel, amount: formatMoney(maxDiscount, currency) })}
+                    </p>
+                  ) : null}
                 </div>
                 <div className="space-y-1.5">
                   <Label htmlFor="pos-notes">{t("pos.ticket.notes")}</Label>
@@ -516,6 +548,14 @@ const AdminPos = () => {
                   <dd className="text-2xl font-bold tabular-nums text-primary" aria-live="polite">{formatMoney(shown.total, currency)}</dd>
                 </div>
               </dl>
+
+              {!canTakePayments && (
+                <Alert variant="destructive" role="alert">
+                  <Lock className="h-4 w-4" />
+                  <AlertTitle>{t("pos.noPay.title")}</AlertTitle>
+                  <AlertDescription className="text-xs">{t("pos.noPay.desc")}</AlertDescription>
+                </Alert>
+              )}
 
               <ToggleGroup
                 type="single"

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Download, Filter, ScanBarcode, Search, ShoppingBag, X } from "lucide-react";
+import { AlertTriangle, Download, Filter, ScanBarcode, Search, ShoppingBag, X } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
 import type { Order } from "@/integrations/supabase/types";
 import { useAuth } from "@/lib/auth";
@@ -13,6 +13,7 @@ import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Label } from "@/components/ui/label";
+import { Badge } from "@/components/ui/badge";
 import {
   ChannelBadge, DataPagination, EmptyState, ErrorState, PageHeader, StatusBadge, TableSkeleton,
 } from "@/components/admin/shared";
@@ -96,7 +97,7 @@ const AdminOrders = () => {
       const [from, to] = pageToRange(page, PAGE_SIZE);
       const base = supabase
         .from("orders")
-        .select("id, order_number, channel, status, payment_status, total, currency, shipping_name, shipping_phone, created_at, customer:customers(id, full_name, phone)", { count: "exact" });
+        .select("id, order_number, channel, status, payment_status, total, currency, shipping_name, shipping_phone, created_at, needs_review, review_reason, customer:customers(id, full_name, phone)", { count: "exact" });
       const { data, error, count } = await applyOrderFilters(base, filters)
         .order("created_at", { ascending: false })
         .range(from, to);
@@ -267,6 +268,16 @@ const AdminOrders = () => {
                         >
                           {o.order_number}
                         </Link>
+                        {o.needs_review && (
+                          <Badge
+                            variant="outline"
+                            className="ml-2 border-destructive/40 bg-destructive/10 px-1.5 py-0 text-[10px] text-destructive"
+                            title={o.review_reason ?? undefined}
+                          >
+                            <AlertTriangle className="mr-1 h-3 w-3" aria-hidden />
+                            {t("admin.orders.needsReview")}
+                          </Badge>
+                        )}
                         <div className="text-xs text-muted-foreground">{formatDate(o.created_at, true)}</div>
                       </TableCell>
                       <TableCell className="max-w-[14rem]">

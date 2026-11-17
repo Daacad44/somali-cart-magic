@@ -71,6 +71,7 @@ export const DEFAULT_SETTINGS: StoreSettings = {
   phone: null,
   address: null,
   receipt_footer: null,
+  max_cashier_discount_pct: 0.2,
   updated_at: new Date(0).toISOString(),
 };
 
@@ -79,7 +80,14 @@ export async function fetchStoreSettings(): Promise<StoreSettings> {
   if (error) throw error;
   if (!data) return DEFAULT_SETTINGS;
   const s = data as StoreSettings;
-  return { ...s, tax_rate: Number(s.tax_rate) || 0, shipping_fee: Number(s.shipping_fee) || 0 };
+  const pct = Number(s.max_cashier_discount_pct);
+  return {
+    ...s,
+    tax_rate: Number(s.tax_rate) || 0,
+    shipping_fee: Number(s.shipping_fee) || 0,
+    // Column may not exist yet on older databases: fall back to the server default (20%).
+    max_cashier_discount_pct: s.max_cashier_discount_pct == null || !Number.isFinite(pct) ? 0.2 : pct,
+  };
 }
 
 /** POS-local copy of store settings (tax rate, receipt header/footer). */

@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { AlertTriangle, KeyRound, Loader2, Pencil, Plus, Smartphone, Store, Trash2, History } from "lucide-react";
 import { toast } from "sonner";
 import { supabase } from "@/integrations/supabase/client";
@@ -26,7 +26,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Form, FormControl, FormDescription, FormField, FormItem, FormLabel } from "@/components/ui/form";
 import { ConfirmDialog, EmptyState, ErrorState, PageHeader, TableSkeleton } from "@/components/admin/shared";
 import { AuditLog } from "@/components/admin/AuditLog";
-import { storeSettingsKey, useAllWalletPrefixes, useStoreSettings, walletPrefixesKey } from "@/hooks/admin/useStoreData";
+import { storeSettingsKey, useAllWalletPrefixes, useStoreSettings } from "@/hooks/admin/useStoreData";
 
 const CURRENCIES = ["USD", "SOS", "SLSH", "KES", "ETB", "EUR"];
 const WALLETS: Wallet[] = ["EVC_PLUS", "ZAAD", "SAHAL", "WAAFI", "JEEB", "EDAHAB"];
@@ -39,6 +39,7 @@ const storeSchema = z.object({
   shipping_fee: z.coerce.number().min(0),
   free_shipping_over: optionalNum,
   tax_percent: z.coerce.number().min(0).max(100),
+  max_discount_percent: z.coerce.number().min(0).max(100),
   phone: z.string().max(40).optional(),
   address: z.string().max(200).optional(),
   receipt_footer: z.string().max(300).optional(),
@@ -51,6 +52,7 @@ const toStoreValues = (s: StoreSettings | null | undefined): StoreValues => ({
   shipping_fee: Number(s?.shipping_fee ?? 0),
   free_shipping_over: s?.free_shipping_over ?? "",
   tax_percent: Math.round(Number(s?.tax_rate ?? 0) * 10000) / 100,
+  max_discount_percent: Math.round(Number(s?.max_cashier_discount_pct ?? 0.2) * 10000) / 100,
   phone: s?.phone ?? "",
   address: s?.address ?? "",
   receipt_footer: s?.receipt_footer ?? "",
@@ -73,6 +75,7 @@ const StoreSettingsForm = () => {
       shipping_fee: Number(v.shipping_fee),
       free_shipping_over: v.free_shipping_over === "" ? null : Number(v.free_shipping_over),
       tax_rate: Math.round(Number(v.tax_percent) * 100) / 10000,
+      max_cashier_discount_pct: Math.round(Number(v.max_discount_percent) * 100) / 10000,
       phone: v.phone?.trim() || null,
       address: v.address?.trim() || null,
       receipt_footer: v.receipt_footer?.trim() || null,
@@ -125,6 +128,16 @@ const StoreSettingsForm = () => {
                   <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">%</span>
                 </div>
                 {errText(!!fieldState.error, "admin.validation.percent")}
+              </FormItem>
+            )} />
+            <FormField control={form.control} name="max_discount_percent" render={({ field, fieldState }) => (
+              <FormItem>
+                <FormLabel>{t("admin.settings.maxDiscount")}</FormLabel>
+                <div className="relative">
+                  <FormControl><Input type="number" step="1" min="0" max="100" inputMode="decimal" className="pr-8" {...field} /></FormControl>
+                  <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">%</span>
+                </div>
+                {errText(!!fieldState.error, "admin.validation.percent") ?? <FormDescription className="text-xs">{t("admin.settings.maxDiscountHint")}</FormDescription>}
               </FormItem>
             )} />
             <FormField control={form.control} name="phone" render={({ field }) => (
@@ -186,8 +199,7 @@ const PrefixDialog = ({
     setSaving(false);
     if (error) return toast.error(error.message);
     toast.success(t("admin.common.saved"));
-    qc.invalidateQueries({ queryKey: walletPrefixesKey });
-    qc.invalidateQueries({ queryKey: ["wallet-prefixes"] });
+    invalidateWalletPrefixes(qc);
     onOpenChange(false);
   };
 
@@ -233,6 +245,11 @@ const PrefixDialog = ({
   );
 };
 
+/** Wallet prefixes are cached under several keys (admin, store, pos, dialogs): refresh them all. */
+function invalidateWalletPrefixes(qc: QueryClient) {
+  void qc.invalidateQueries({ predicate: (q) => JSON.stringify(q.queryKey).includes("wallet-prefixes") });
+}
+
 const WalletPrefixes = () => {
   const { t } = useI18n();
   const qc = useQueryClient();
@@ -245,8 +262,7 @@ const WalletPrefixes = () => {
   const toggle = async (r: WalletPrefixRow, v: boolean) => {
     const { error } = await supabase.from("wallet_prefixes").update({ is_active: v }).eq("prefix", r.prefix);
     if (error) return toast.error(error.message);
-    qc.invalidateQueries({ queryKey: walletPrefixesKey });
-    qc.invalidateQueries({ queryKey: ["wallet-prefixes"] });
+    invalidateWalletPrefixes(qc);
   };
 
   return (
@@ -307,8 +323,7 @@ const WalletPrefixes = () => {
           const { error } = await supabase.from("wallet_prefixes").delete().eq("prefix", toDelete!.prefix);
           if (error) { toast.error(error.message); throw error; }
           toast.success(t("admin.common.deleted"));
-          qc.invalidateQueries({ queryKey: walletPrefixesKey });
-          qc.invalidateQueries({ queryKey: ["wallet-prefixes"] });
+          invalidateWalletPrefixes(qc);
         }}
       />
     </div>

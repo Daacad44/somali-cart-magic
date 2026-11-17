@@ -3,7 +3,8 @@ import { AlertCircle, ArrowLeft, CreditCard, FileQuestion } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useI18n } from "@/lib/i18n";
-import { isOrderPayable, useMyOrder } from "@/hooks/store/useOrders";
+import { useMyOrder } from "@/hooks/store/useOrders";
+import { formatCountdown, usePaymentClock } from "@/hooks/usePaymentClock";
 import EmptyState from "@/components/store/EmptyState";
 import OrderItemsList from "@/components/store/OrderItemsList";
 import OrderTotals from "@/components/store/OrderTotals";
@@ -16,6 +17,7 @@ const AccountOrderDetail = () => {
   const { id } = useParams();
   const { t, formatDate, formatMoney } = useI18n();
   const { data: order, isLoading, isError, refetch } = useMyOrder(id);
+  const clock = usePaymentClock(order);
 
   if (isLoading) {
     return (
@@ -28,7 +30,7 @@ const AccountOrderDetail = () => {
   if (isError) return <EmptyState icon={AlertCircle} title={t("store.errors.loadFailed")} action={<Button variant="outline" onClick={() => refetch()}>{t("common.retry")}</Button>} />;
   if (!order) return <EmptyState icon={FileQuestion} title={t("store.order.notFound")} action={<Button asChild><Link to="/account?tab=orders">{t("store.nav.orders")}</Link></Button>} />;
 
-  const payable = isOrderPayable(order);
+  const payable = clock.payable;
 
   return (
     <div className="container mx-auto max-w-4xl px-4 py-8 lg:px-8">
@@ -60,6 +62,14 @@ const AccountOrderDetail = () => {
             </Button>
             <CancelOrderButton orderId={order.id} orderNumber={order.order_number} />
           </div>
+        </div>
+      )}
+
+      {clock.inFlight && (
+        <div className="mt-6 rounded-xl border border-warning/30 bg-warning/5 p-5" role="status" aria-live="polite">
+          <p className="font-semibold">{t("store.order.inProgress")}</p>
+          <p className="text-sm text-muted-foreground">{t("store.order.inProgressDesc")}</p>
+          <p className="mt-1 text-xs tabular-nums text-muted-foreground">{t("store.pay.retryIn", { time: formatCountdown(clock.secondsLeft) })}</p>
         </div>
       )}
 

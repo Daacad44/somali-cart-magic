@@ -6,6 +6,7 @@ import { toast } from "sonner";
 import { supabase } from "@/integrations/supabase/client";
 import type { Payment } from "@/integrations/supabase/types";
 import { payOrder } from "@/lib/payments";
+import { serverPayMessage } from "@/lib/payment-state";
 import { useAuth } from "@/lib/auth";
 import { useI18n } from "@/lib/i18n";
 import { maskPhone, WALLET_LABELS } from "@/lib/wallet";
@@ -44,7 +45,7 @@ function applyFilters<Q>(query: Q, f: Filters): Q {
 }
 
 const AdminPayments = () => {
-  const { t, formatMoney, formatDate } = useI18n();
+  const { t, lang, formatMoney, formatDate } = useI18n();
   const { can } = useAuth();
   const qc = useQueryClient();
   const [params, setParams] = useSearchParams();
@@ -252,8 +253,9 @@ const AdminPayments = () => {
         onConfirm={async (reason) => {
           if (!reverse) return;
           const res = await payOrder({ action: "reverse", order_id: reverse.order_id, payment_id: reverse.id, reason });
-          if (!res.ok) { toast.error(res.message || t("admin.payment.failed")); throw new Error(res.message); }
-          toast.success(res.message || t("admin.orderDetail.reversed"));
+          const msg = serverPayMessage(res, lang);
+          if (!res.ok) { toast.error(msg || t("admin.payment.failed")); throw new Error(msg); }
+          toast.success(msg || t("admin.orderDetail.reversed"));
           qc.invalidateQueries({ queryKey: ["admin", "payments"] });
           qc.invalidateQueries({ queryKey: ["admin", "order", reverse.order_id] });
         }}

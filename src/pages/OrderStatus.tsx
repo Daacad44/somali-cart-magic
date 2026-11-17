@@ -1,11 +1,12 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import { motion } from "framer-motion";
 import { AlertCircle, CheckCircle2, Clock, FileQuestion, Loader2, XCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useI18n } from "@/lib/i18n";
-import { isOrderPayable, useMyOrder } from "@/hooks/store/useOrders";
+import { useMyOrder } from "@/hooks/store/useOrders";
+import { formatCountdown, usePaymentClock } from "@/hooks/usePaymentClock";
 import EmptyState from "@/components/store/EmptyState";
 import OrderItemsList from "@/components/store/OrderItemsList";
 import OrderTotals from "@/components/store/OrderTotals";
@@ -28,6 +29,9 @@ const OrderStatus = () => {
   const { t, formatDate } = useI18n();
   const { data: order, isLoading, isError, refetch } = useMyOrder(id);
   const payErrorRef = useRef(state.payError ?? null);
+  // Set when the last attempt ended without a gateway answer (code UNKNOWN / still pending).
+  const [noAnswer, setNoAnswer] = useState(!!state.payError);
+  const clock = usePaymentClock(order);
 
   // Drop one-shot router state so a refresh doesn't replay the error banner.
   useEffect(() => {
@@ -57,8 +61,8 @@ const OrderStatus = () => {
   }
 
   const paid = order.payment_status === "paid";
-  const payable = isOrderPayable(order);
-  const inProgress = order.payment_status === "pending";
+  const payable = clock.payable;
+  const inProgress = clock.inFlight;
   const cancelled = order.status === "cancelled";
 
   return (
@@ -100,15 +104,30 @@ const OrderStatus = () => {
             <section className="rounded-xl border border-border bg-card p-6" aria-labelledby="pay-title">
               <h2 id="pay-title" className="font-heading text-lg font-bold">{t("store.order.completePayment")}</h2>
               <p className="mb-4 mt-1 text-sm text-muted-foreground">{t("store.order.completePaymentDesc")}</p>
-              <PayOrderPanel order={order} initialError={payErrorRef.current} onPaid={() => { payErrorRef.current = null; void refetch(); }} />
+              <PayOrderPanel
+                order={order}
+                initialError={payErrorRef.current}
+                onPaid={() => { payErrorRef.current = null; void refetch(); }}
+                onFailed={(res) => setNoAnswer(res.code === "UNKNOWN" || res.code === "PAYMENT_IN_PROGRESS" || res.status === "pending")}
+              />
             </section>
           )}
           {inProgress && (
             <section className="flex items-start gap-3 rounded-xl border border-warning/30 bg-warning/5 p-5">
               <Loader2 className="mt-0.5 h-5 w-5 shrink-0 animate-spin text-warning" />
-              <div>
-                <p className="font-semibold">{t("store.order.inProgress")}</p>
-                <p className="text-sm text-muted-foreground">{t("store.order.inProgressDesc")}</p>
+              <div role="status" aria-live="polite">
+                {noAnswer ? (
+                  <>
+                    <p className="font-semibold">{t("store.pay.unknownTitle")}</p>
+                    <p className="text-sm text-muted-foreground">{t("store.pay.unknownDesc", { time: formatCountdown(clock.secondsLeft) })}</p>
+                  </>
+                ) : (
+                  <>
+                    <p className="font-semibold">{t("store.order.inProgress")}</p>
+                    <p className="text-sm text-muted-foreground">{t("store.order.inProgressDesc")}</p>
+                    <p className="mt-1 text-xs tabular-nums text-muted-foreground">{t("store.pay.retryIn", { time: formatCountdown(clock.secondsLeft) })}</p>
+                  </>
+                )}
               </div>
             </section>
           )}

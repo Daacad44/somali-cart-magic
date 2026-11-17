@@ -16,10 +16,12 @@ const PayOrderPanel = ({
   order,
   initialError,
   onPaid,
+  onFailed,
 }: {
   order: Order;
   initialError?: string | null;
   onPaid?: (res: PayResponse) => void;
+  onFailed?: (res: PayResponse) => void;
 }) => {
   const { t, formatMoney } = useI18n();
   const [phone, setPhone] = useState(order.shipping_phone ?? "");
@@ -36,7 +38,10 @@ const PayOrderPanel = ({
       toast.success(t("store.pay.success"));
       onPaid?.(res);
     } else if (res.code !== "IN_FLIGHT") {
-      toast.error(errorMessage(res));
+      // No definitive answer: the attempt stays pending, so warn rather than call it a failure.
+      if (res.code === "UNKNOWN" || res.code === "PAYMENT_IN_PROGRESS") toast.warning(errorMessage(res));
+      else toast.error(errorMessage(res));
+      onFailed?.(res);
     }
   };
 

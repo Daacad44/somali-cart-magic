@@ -3,11 +3,13 @@ import { useQueryClient } from "@tanstack/react-query";
 import type { PayResponse } from "@/integrations/supabase/types";
 import { payOrder } from "@/lib/payments";
 import { useI18n } from "@/lib/i18n";
+import { serverPayMessage } from "@/lib/payment-state";
 import { storeKeys } from "./useCatalog";
 
 const KNOWN_CODES = [
   "WALLET_NOT_DETECTED", "INVALID_PHONE", "ORDER_NOT_PAYABLE", "FORBIDDEN", "DECLINED",
-  "TIMEOUT", "GATEWAY_ERROR", "NOT_CONFIGURED", "NETWORK",
+  "TIMEOUT", "GATEWAY_ERROR", "NOT_CONFIGURED", "NETWORK", "PAYMENT_IN_PROGRESS", "CANCELLED", "NOT_FOUND",
+  "BAD_REQUEST", "UNAUTHORIZED", "UNKNOWN", "NOT_REVERSIBLE",
 ];
 
 /** i18n key for a failed PayResponse code (falls back to the server message). */
@@ -50,13 +52,13 @@ export function usePayOrder() {
 
 /** Translates a failed PayResponse into a user-facing message. */
 export function usePayErrorMessage() {
-  const { t } = useI18n();
+  const { t, lang } = useI18n();
   return useCallback(
-    (res: Pick<PayResponse, "code" | "message"> | null | undefined) => {
+    (res: Pick<PayResponse, "code" | "message" | "message_en"> | null | undefined) => {
       if (!res) return "";
       const key = payErrorKey(res.code);
-      return key ? t(key) : res.message || t("common.error");
+      return key ? t(key) : serverPayMessage(res, lang) || t("common.error");
     },
-    [t],
+    [t, lang],
   );
 }

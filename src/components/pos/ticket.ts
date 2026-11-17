@@ -167,11 +167,28 @@ export function computeTotals(lines: TicketLine[], discount: number, taxRate: nu
   };
 }
 
-/** Parses a user-typed discount and clamps it to [0, subtotal]. */
-export function clampDiscount(input: string | number, subtotal: number): number {
+/**
+ * Largest discount allowed on a ticket. The total must stay > 0, so the discount
+ * is always below the subtotal (by at least one cent). Cashiers without
+ * orders.manage are further limited to `maxPct` (fraction, e.g. 0.2) of the subtotal,
+ * rounded down to the cent so the server's DISCOUNT_TOO_HIGH check never trips.
+ */
+export function maxDiscountFor(subtotal: number, opts: { canManage: boolean; maxPct: number }): number {
+  const subCents = toCents(subtotal);
+  if (subCents <= 0) return 0;
+  let maxCents = subCents - 1;
+  if (!opts.canManage) {
+    const pct = Math.min(Math.max(Number(opts.maxPct) || 0, 0), 1);
+    maxCents = Math.min(maxCents, Math.floor(Math.round(subCents * pct * 1e6) / 1e6));
+  }
+  return Math.max(0, maxCents) / 100;
+}
+
+/** Parses a user-typed discount and clamps it to [0, max] (max defaults to the subtotal). */
+export function clampDiscount(input: string | number, subtotal: number, max: number = subtotal): number {
   const n = typeof input === "number" ? input : parseFloat(String(input).replace(",", "."));
   if (!Number.isFinite(n) || n <= 0) return 0;
-  return Math.min(round2(n), round2(subtotal));
+  return Math.max(0, Math.min(round2(n), round2(subtotal), round2(max)));
 }
 
 /* ------------------------------------------------------------------ */
@@ -180,7 +197,7 @@ export function clampDiscount(input: string | number, subtotal: number): number 
 
 export type PayMethod = "wallet" | "cash";
 
-export type SaleError = "EMPTY_TICKET" | "INVALID_PHONE" | "WALLET_NOT_DETECTED" | "INVALID_QUANTITY";
+export type SaleError = "EMPTY_TICKET" | "INVALID_PHONE" | "WALLET_NOT_DETECTED" | "INVALID_QUANTITY" | "DISCOUNT_TOO_HIGH";
 
 export interface SaleInput {
   lines: TicketLine[];
@@ -189,6 +206,10 @@ export interface SaleInput {
   normalizedPhone: string | null;
   detectedWallet: Wallet | null;
   overrideWallet: Wallet | null;
+  /** Discount that will be sent to create_order (defaults to 0). */
+  discount?: number;
+  /** Largest allowed discount, see maxDiscountFor (unchecked when omitted). */
+  maxDiscount?: number;
 }
 
 export function validateSale(input: SaleInput): SaleError[] {
@@ -196,6 +217,12 @@ export function validateSale(input: SaleInput): SaleError[] {
   if (input.lines.length === 0) errors.push("EMPTY_TICKET");
   if (input.lines.some((l) => !Number.isInteger(l.quantity) || l.quantity <= 0 || l.quantity > l.stock)) {
     errors.push("INVALID_QUANTITY");
+  }
+  const discount = toCents(input.discount ?? 0);
+  if (discount > 0 && input.lines.length > 0) {
+    const subCents = input.lines.reduce((s, l) => s + toCents(l.unitPrice) * l.quantity, 0);
+    const over = input.maxDiscount !== undefined && discount > toCents(input.maxDiscount);
+    if (over || discount >= subCents) errors.push("DISCOUNT_TOO_HIGH");
   }
   if (input.method === "wallet") {
     if (!input.normalizedPhone) errors.push("INVALID_PHONE");
@@ -220,6 +247,8 @@ export interface PayAttempt {
 export interface PayError {
   code: string;
   message: string;
+  /** For code UNKNOWN / PAYMENT_IN_PROGRESS: epoch ms after which a new attempt is allowed. */
+  retryAt?: number;
 }
 
 export interface PayState {

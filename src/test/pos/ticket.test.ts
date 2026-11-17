@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Order } from "@/integrations/supabase/types";
 import {
   addLine, clampDiscount, computeTotals, initialPayState, isBusy, isTicketLocked, lineKey, maxQtyForLine,
-  missingVariants, payReducer, removeLine, round2, setLineQty, toRpcItems, validateSale,
+  maxDiscountFor, missingVariants, payReducer, removeLine, round2, setLineQty, toRpcItems, validateSale,
   type PayState, type TicketLine, type TicketProduct,
 } from "@/components/pos/ticket";
 
@@ -115,6 +115,18 @@ describe("money", () => {
     expect(clampDiscount("abc", 100)).toBe(0);
     expect(clampDiscount(200, 50)).toBe(50);
     expect(clampDiscount(-1, 50)).toBe(0);
+    expect(clampDiscount(30, 100, 20)).toBe(20);
+    expect(clampDiscount(10, 100, 20)).toBe(10);
+  });
+
+  it("maxDiscountFor keeps the total positive and applies the cashier limit", () => {
+    expect(maxDiscountFor(100, { canManage: true, maxPct: 0.2 })).toBe(99.99);
+    expect(maxDiscountFor(100, { canManage: false, maxPct: 0.2 })).toBe(20);
+    // floors to the cent: 33.33 * 0.2 = 6.666 → 6.66
+    expect(maxDiscountFor(33.33, { canManage: false, maxPct: 0.2 })).toBe(6.66);
+    expect(maxDiscountFor(0.01, { canManage: false, maxPct: 1 })).toBe(0);
+    expect(maxDiscountFor(50, { canManage: false, maxPct: 0 })).toBe(0);
+    expect(maxDiscountFor(0, { canManage: true, maxPct: 0.2 })).toBe(0);
   });
 });
 
@@ -141,6 +153,15 @@ describe("validateSale", () => {
     const bad = [{ ...lines[0], quantity: 99 }];
     expect(validateSale({ lines: bad, method: "cash", normalizedPhone: null, detectedWallet: null, overrideWallet: null }))
       .toContain("INVALID_QUANTITY");
+  });
+  it("rejects a discount above the limit or that zeroes the total", () => {
+    // product() line subtotal
+    const sub = computeTotals(lines, 0, 0).subtotal;
+    const base = { lines, method: "cash" as const, normalizedPhone: null, detectedWallet: null, overrideWallet: null };
+    expect(validateSale({ ...base, discount: sub })).toEqual(["DISCOUNT_TOO_HIGH"]);
+    expect(validateSale({ ...base, discount: 1, maxDiscount: 0.5 })).toEqual(["DISCOUNT_TOO_HIGH"]);
+    expect(validateSale({ ...base, discount: 0.5, maxDiscount: 0.5 })).toEqual([]);
+    expect(validateSale({ ...base, discount: 0, maxDiscount: 0 })).toEqual([]);
   });
 });
 

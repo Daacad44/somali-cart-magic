@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Banknote, Loader2, RefreshCw, Smartphone, XCircle, Search } from "lucide-react";
+import { Banknote, Clock, Loader2, RefreshCw, Smartphone, XCircle, Search } from "lucide-react";
 import type { WalletPrefixRow } from "@/integrations/supabase/types";
 import { WALLET_LABELS, maskPhone, type Wallet } from "@/lib/wallet";
 import { useI18n } from "@/lib/i18n";
@@ -9,10 +9,12 @@ import { detectFor } from "./walletDetect";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { useCountdown } from "@/hooks/usePaymentClock";
 
 const KNOWN_CODES = [
   "DECLINED", "TIMEOUT", "WALLET_NOT_DETECTED", "INVALID_PHONE", "ORDER_NOT_PAYABLE", "FORBIDDEN",
-  "GATEWAY_ERROR", "NOT_CONFIGURED", "NETWORK",
+  "GATEWAY_ERROR", "NOT_CONFIGURED", "NETWORK", "PAYMENT_IN_PROGRESS", "CANCELLED", "NOT_FOUND", "BAD_REQUEST",
+  "UNAUTHORIZED", "UNKNOWN", "NOT_REVERSIBLE",
 ];
 
 export function payErrorKey(code: string | undefined): string {
@@ -65,7 +67,11 @@ export function PaymentStatusDialog({
   const walletLabel = attempt?.wallet ? WALLET_LABELS[attempt.wallet] : "";
   const det = detectFor(phone, prefixes, override);
   const canRetryWallet = Boolean(det.normalized && det.effective);
-  const maybeStillPending = ["TIMEOUT", "NETWORK", "GATEWAY_ERROR", "ORDER_NOT_PAYABLE"].includes(error?.code ?? "");
+  // No gateway answer: the attempt stays pending server-side, so new attempts / cancel are blocked until it is stale.
+  const retryIn = useCountdown(phase === "failed" ? error?.retryAt : null);
+  const blocked = retryIn > 0;
+  const maybeStillPending = blocked || ["TIMEOUT", "NETWORK", "GATEWAY_ERROR", "ORDER_NOT_PAYABLE", "UNKNOWN", "PAYMENT_IN_PROGRESS"]
+    .includes(error?.code ?? "");
 
   return (
     <Dialog open={open} onOpenChange={(o) => !busy && onOpenChange(o)}>
@@ -134,11 +140,19 @@ export function PaymentStatusDialog({
                 {t("pos.flow.failedOrderKept", { order: order.order_number, total: formatMoney(order.total, currency) })}
               </DialogDescription>
             </DialogHeader>
-            <Alert variant="destructive">
-              <XCircle className="h-4 w-4" />
-              <AlertTitle>{t(payErrorKey(error?.code))}</AlertTitle>
-              {error?.message && <AlertDescription className="text-xs">{error.message}</AlertDescription>}
-            </Alert>
+            {blocked ? (
+              <Alert className="border-warning/40 bg-warning/10" role="status" aria-live="polite">
+                <Clock className="h-4 w-4 !text-warning" />
+                <AlertTitle>{t("pos.flow.unknownTitle")}</AlertTitle>
+                <AlertDescription className="text-xs tabular-nums">{t("pos.flow.unknownDesc", { time: mmss(retryIn) })}</AlertDescription>
+              </Alert>
+            ) : (
+              <Alert variant="destructive">
+                <XCircle className="h-4 w-4" />
+                <AlertTitle>{t(payErrorKey(error?.code))}</AlertTitle>
+                {error?.message && <AlertDescription className="text-xs">{error.message}</AlertDescription>}
+              </Alert>
+            )}
 
             <div className="space-y-2">
               <p className="text-sm font-medium">{t("pos.flow.retryWith")}</p>
@@ -152,14 +166,14 @@ export function PaymentStatusDialog({
             </div>
 
             <DialogFooter className="flex-col gap-2 sm:flex-col sm:space-x-0">
-              <Button className="h-11 w-full" onClick={onRetry} disabled={!canRetryWallet}>
+              <Button className="h-11 w-full" onClick={onRetry} disabled={!canRetryWallet || blocked}>
                 <RefreshCw className="mr-2 h-4 w-4" /> {t("pos.flow.retry")}
               </Button>
               <div className="grid grid-cols-2 gap-2">
-                <Button variant="secondary" className="h-11" onClick={onPayCash}>
+                <Button variant="secondary" className="h-11" onClick={onPayCash} disabled={blocked}>
                   <Banknote className="mr-2 h-4 w-4" /> {t("pos.flow.payCash")}
                 </Button>
-                <Button variant="outline" className="h-11 text-destructive hover:text-destructive" onClick={onCancelOrder}>
+                <Button variant="outline" className="h-11 text-destructive hover:text-destructive" onClick={onCancelOrder} disabled={blocked}>
                   <XCircle className="mr-2 h-4 w-4" /> {t("pos.flow.cancelOrder")}
                 </Button>
               </div>

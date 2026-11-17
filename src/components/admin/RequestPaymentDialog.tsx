@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { CheckCircle2, Loader2, Smartphone, XCircle } from "lucide-react";
+import { CheckCircle2, Clock, Loader2, Smartphone, XCircle } from "lucide-react";
 import { toast } from "sonner";
 import type { Order, PayResponse } from "@/integrations/supabase/types";
 import { fetchWalletPrefixes, payOrder } from "@/lib/payments";
+import { PAYMENT_STALE_MS, serverPayMessage } from "@/lib/payment-state";
+import { formatCountdown, useCountdown } from "@/hooks/usePaymentClock";
 import { detectWallet, normalizeSomaliPhone, WALLET_LABELS, type Wallet } from "@/lib/wallet";
 import { useI18n } from "@/lib/i18n";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -20,17 +22,20 @@ const WALLETS: Wallet[] = ["EVC_PLUS", "ZAAD", "SAHAL", "WAAFI", "JEEB", "EDAHAB
 export const RequestPaymentDialog = ({
   order, open, onOpenChange, onDone,
 }: { order: Order; open: boolean; onOpenChange: (o: boolean) => void; onDone?: (r: PayResponse) => void }) => {
-  const { t, formatMoney } = useI18n();
+  const { t, lang, formatMoney } = useI18n();
   const [phone, setPhone] = useState(order.shipping_phone ?? order.customer?.phone ?? "");
   const [wallet, setWallet] = useState<string>(AUTO);
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<PayResponse | null>(null);
+  const [retryAt, setRetryAt] = useState<number | null>(null);
+  const retryIn = useCountdown(retryAt);
 
   useEffect(() => {
     if (open) {
       setPhone(order.shipping_phone ?? order.customer?.phone ?? "");
       setWallet(AUTO);
       setResult(null);
+      setRetryAt(null);
     }
   }, [open, order.shipping_phone, order.customer?.phone]);
 
@@ -43,6 +48,7 @@ export const RequestPaymentDialog = ({
     if (!normalized) return;
     setBusy(true);
     setResult(null);
+    const startedAt = Date.now();
     const res = await payOrder({
       action: "purchase",
       order_id: order.id,
@@ -51,8 +57,13 @@ export const RequestPaymentDialog = ({
     });
     setBusy(false);
     setResult(res);
-    if (res.ok) toast.success(res.message || t("admin.payment.approved"));
-    else toast.error(res.message || t("admin.payment.failed"));
+    // No gateway answer: the attempt stays pending until it goes stale.
+    const noAnswer = !res.ok && (res.code === "UNKNOWN" || res.status === "pending");
+    setRetryAt(noAnswer ? startedAt + PAYMENT_STALE_MS : null);
+    const msg = serverPayMessage(res, lang);
+    if (res.ok) toast.success(msg || t("admin.payment.approved"));
+    else if (noAnswer) toast.warning(t("admin.payment.unknownTitle"));
+    else toast.error(msg || t("admin.payment.failed"));
     onDone?.(res);
   };
 
@@ -75,11 +86,20 @@ export const RequestPaymentDialog = ({
             <p className="font-medium">{t("admin.payment.waiting")}</p>
             <p className="max-w-xs text-sm text-muted-foreground">{t("admin.payment.waitingHint")}</p>
           </div>
+        ) : result && retryAt ? (
+          <div className="flex flex-col items-center gap-2 py-6 text-center" role="status" aria-live="polite">
+            <Clock className="h-10 w-10 text-warning" />
+            <p className="font-medium">{t("admin.payment.unknownTitle")}</p>
+            <p className="max-w-xs text-sm tabular-nums text-muted-foreground">
+              {t("admin.payment.unknownDesc", { time: formatCountdown(retryIn) })}
+            </p>
+            {result.code && <p className="text-xs text-muted-foreground">{result.code}</p>}
+          </div>
         ) : result ? (
           <div className="flex flex-col items-center gap-2 py-6 text-center" aria-live="polite">
             {result.ok ? <CheckCircle2 className="h-10 w-10 text-success" /> : <XCircle className="h-10 w-10 text-destructive" />}
             <p className="font-medium">{result.ok ? t("admin.payment.approved") : t("admin.payment.failed")}</p>
-            <p className="text-sm text-muted-foreground">{result.message}</p>
+            <p className="text-sm text-muted-foreground">{serverPayMessage(result, lang)}</p>
             {result.code && <p className="text-xs text-muted-foreground">{result.code}</p>}
           </div>
         ) : (
@@ -122,7 +142,11 @@ export const RequestPaymentDialog = ({
         <DialogFooter>
           {result ? (
             <>
-              {!result.ok && <Button variant="outline" onClick={() => setResult(null)}>{t("common.retry")}</Button>}
+              {!result.ok && (
+                <Button variant="outline" onClick={() => { setResult(null); setRetryAt(null); }} disabled={retryIn > 0}>
+                  {t("common.retry")}
+                </Button>
+              )}
               <Button onClick={() => onOpenChange(false)}>{t("common.close")}</Button>
             </>
           ) : (

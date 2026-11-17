@@ -4,6 +4,7 @@ import { supabase, isSupabaseConfigured } from "@/integrations/supabase/client";
 import type { Order, OrderItem, Payment } from "@/integrations/supabase/types";
 import { useAuth } from "@/lib/auth";
 import { subscribeToOrderPayments } from "@/lib/payments";
+import { hasInFlightPayment, isOrderPayable as isPayable } from "@/lib/payment-state";
 import { storeKeys } from "./useCatalog";
 
 function normalizeOrder(o: Order): Order {
@@ -61,7 +62,8 @@ export function useMyOrder(id: string | undefined, { live = true }: { live?: boo
       if (error) throw error;
       return data ? normalizeOrder(data as Order) : null;
     },
-    refetchInterval: (q) => (q.state.data?.payment_status === "pending" ? 5000 : false),
+    // Poll only while an attempt can still be approved; stop once it has gone stale.
+    refetchInterval: (q) => (hasInFlightPayment(q.state.data) ? 5000 : false),
   });
 
   useEffect(() => {
@@ -100,7 +102,10 @@ export function useCancelOrder() {
   });
 }
 
-/** Whether a customer may still pay / cancel this order. */
-export function isOrderPayable(o: Pick<Order, "status" | "payment_status"> | null | undefined): boolean {
-  return !!o && o.status === "pending" && (o.payment_status === "unpaid" || o.payment_status === "failed");
+/**
+ * Whether a customer may still pay / cancel this order: unpaid/failed, or
+ * 'pending' whose newest attempt is older than PAYMENT_STALE_MINUTES.
+ */
+export function isOrderPayable(o: Parameters<typeof isPayable>[0], now: Date | number = Date.now()): boolean {
+  return isPayable(o, now);
 }

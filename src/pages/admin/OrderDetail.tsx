@@ -2,12 +2,15 @@ import { lazy, Suspense, useEffect, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  ArrowLeft, Ban, CreditCard, Loader2, MapPin, Package, Printer, RotateCcw, Send, StickyNote, Truck, User,
+  AlertTriangle, ArrowLeft, Ban, BadgeCheck, CreditCard, Loader2, MapPin, Package, Printer, RotateCcw, Send, StickyNote,
+  Timer, Truck, User,
 } from "lucide-react";
 import { toast } from "sonner";
 import { supabase, rpcErrorMessage } from "@/integrations/supabase/client";
 import type { Order, OrderStatus, Payment } from "@/integrations/supabase/types";
 import { payOrder } from "@/lib/payments";
+import { isPaymentStale, serverPayMessage } from "@/lib/payment-state";
+import { formatCountdown, usePaymentClock } from "@/hooks/usePaymentClock";
 import { useAuth } from "@/lib/auth";
 import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
@@ -19,6 +22,8 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { ChannelBadge, ConfirmDialog, EmptyState, ErrorState, StatusBadge, WalletBadge } from "@/components/admin/shared";
 import { RequestPaymentDialog } from "@/components/admin/RequestPaymentDialog";
+import { ConfirmPaymentDialog, confirmablePayments } from "@/components/admin/ConfirmPaymentDialog";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 
 // Owned by the POS workstream; loaded lazily so the receipt bundle stays out of the admin chunk.
@@ -92,6 +97,7 @@ const AdminOrderDetail = () => {
   const [cancelOpen, setCancelOpen] = useState(false);
   const [reverseTarget, setReverseTarget] = useState<Payment | null>(null);
   const [payOpen, setPayOpen] = useState(false);
+  const [confirmOpen, setConfirmOpen] = useState(false);
 
   const key = ["admin", "order", id];
   const q = useQuery({
@@ -140,6 +146,7 @@ const AdminOrderDetail = () => {
   });
 
   const order = q.data;
+  const clock = usePaymentClock(order);
   const printing = params.get("print") === "1";
   const closePrint = () => setParams((p) => { const n = new URLSearchParams(p); n.delete("print"); return n; }, { replace: true });
 
@@ -169,9 +176,13 @@ const AdminOrderDetail = () => {
 
   const isClosed = order.status === "cancelled" || order.status === "refunded";
   const canManage = can("orders.manage");
-  const canCancel = !isClosed && (order.payment_status === "unpaid" || order.payment_status === "failed")
-    && (canManage || (order.created_by === user?.id && can("pos.use")));
-  const canRequestPay = can("payments.initiate") && !isClosed && order.payment_status !== "paid" && order.payment_status !== "pending";
+  // Unpaid/failed, or 'pending' whose newest attempt is past PAYMENT_STALE_MINUTES.
+  const paymentOpen = order.payment_status === "unpaid" || order.payment_status === "failed" || isPaymentStale(order, clock.now);
+  const canCancel = !isClosed && paymentOpen && (canManage || (order.created_by === user?.id && can("pos.use")));
+  const canRequestPay = can("payments.initiate") && !isClosed && paymentOpen;
+  const canConfirmManual = can("payments.refund") && !isClosed && order.payment_status !== "paid"
+    && order.payment_status !== "refunded" && confirmablePayments(order.payments).length > 0;
+  const isPaid = order.payment_status === "paid";
   const statusOptions = FULFILMENT.filter((s) => s !== order.status);
   const cur = order.currency;
 
@@ -214,6 +225,11 @@ const AdminOrderDetail = () => {
               <Send className="mr-2 h-4 w-4" /> {t("admin.orderDetail.requestPayment")}
             </Button>
           )}
+          {canConfirmManual && (
+            <Button variant="outline" size="sm" onClick={() => setConfirmOpen(true)}>
+              <BadgeCheck className="mr-2 h-4 w-4" /> {t("admin.orderDetail.confirmManual")}
+            </Button>
+          )}
           {canCancel && (
             <Button variant="outline" size="sm" className="border-destructive/40 text-destructive hover:bg-destructive/10 hover:text-destructive" onClick={() => setCancelOpen(true)}>
               <Ban className="mr-2 h-4 w-4" /> {t("admin.orderDetail.cancelOrder")}
@@ -221,6 +237,39 @@ const AdminOrderDetail = () => {
           )}
         </div>
       </div>
+
+      {order.needs_review && (
+        <Alert variant="destructive" className="mb-4 border-2">
+          <AlertTriangle className="h-4 w-4" />
+          <AlertTitle>{t("admin.orderDetail.needsReview")}</AlertTitle>
+          <AlertDescription className="flex flex-wrap items-center justify-between gap-3">
+            <span className="whitespace-pre-wrap">{order.review_reason || t("admin.orderDetail.needsReviewDefault")}</span>
+            {can("orders.manage") && (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={async () => {
+                  const { error } = await supabase.rpc("resolve_order_review", { p_order_id: order.id, p_note: null });
+                  if (error) toast.error(rpcErrorMessage(error, lang));
+                  else {
+                    toast.success(t("admin.orderDetail.reviewResolved"));
+                    qc.invalidateQueries({ queryKey: ["admin", "order", order.id] });
+                  }
+                }}
+              >
+                {t("admin.orderDetail.markResolved")}
+              </Button>
+            )}
+          </AlertDescription>
+        </Alert>
+      )}
+      {clock.inFlight && !isClosed && (
+        <Alert className="mb-4 border-warning/40 bg-warning/10" role="status" aria-live="polite">
+          <Timer className="h-4 w-4 !text-warning" />
+          <AlertTitle>{t("admin.orderDetail.inFlight")}</AlertTitle>
+          <AlertDescription className="tabular-nums">{t("admin.orderDetail.inFlightDesc", { time: formatCountdown(clock.secondsLeft) })}</AlertDescription>
+        </Alert>
+      )}
 
       <div className="grid gap-4 lg:grid-cols-3">
         <div className="space-y-4 lg:col-span-2">
@@ -275,16 +324,14 @@ const AdminOrderDetail = () => {
                 <CardTitle className="flex items-center gap-2 text-base"><Truck className="h-4 w-4 text-muted-foreground" />{t("admin.orderDetail.fulfilment")}</CardTitle>
               </CardHeader>
               <CardContent className="space-y-3">
-                <Select value={nextStatus} onValueChange={setNextStatus}>
+                <Select value={nextStatus} onValueChange={setNextStatus} disabled={!isPaid}>
                   <SelectTrigger aria-label={t("admin.orderDetail.changeStatus")}><SelectValue placeholder={t("admin.orderDetail.changeStatus")} /></SelectTrigger>
                   <SelectContent>
                     {statusOptions.map((s) => <SelectItem key={s} value={s}>{t(`status.${s}`)}</SelectItem>)}
                   </SelectContent>
                 </Select>
-                {order.payment_status !== "paid" && nextStatus && (
-                  <p className="text-xs text-warning">{t("admin.orderDetail.unpaidWarning")}</p>
-                )}
-                <Button className="w-full" disabled={!nextStatus || statusMut.isPending} onClick={() => statusMut.mutate(nextStatus)}>
+                {!isPaid && <p className="text-xs text-muted-foreground">{t("admin.orderDetail.payFirst")}</p>}
+                <Button className="w-full" disabled={!isPaid || !nextStatus || statusMut.isPending} onClick={() => statusMut.mutate(nextStatus)}>
                   {statusMut.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
                   {t("admin.orderDetail.updateStatus")}
                 </Button>
@@ -370,13 +417,17 @@ const AdminOrderDetail = () => {
         onConfirm={async (reason) => {
           if (!reverseTarget) return;
           const res = await payOrder({ action: "reverse", order_id: order.id, payment_id: reverseTarget.id, reason });
-          if (!res.ok) { toast.error(res.message || t("admin.payment.failed")); throw new Error(res.message); }
-          toast.success(res.message || t("admin.orderDetail.reversed"));
+          const msg = serverPayMessage(res, lang);
+          if (!res.ok) { toast.error(msg || t("admin.payment.failed")); throw new Error(msg); }
+          toast.success(msg || t("admin.orderDetail.reversed"));
           refresh();
         }}
       />
 
       <RequestPaymentDialog order={order} open={payOpen} onOpenChange={setPayOpen} onDone={() => refresh()} />
+      {canConfirmManual && (
+        <ConfirmPaymentDialog order={order} open={confirmOpen} onOpenChange={setConfirmOpen} onDone={() => refresh()} />
+      )}
     </div>
   );
 };
