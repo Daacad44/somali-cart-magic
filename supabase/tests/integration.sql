@@ -179,5 +179,85 @@ do $$ declare s jsonb; begin
   assert (select count(*) from orders) = 2, 'owner sees all orders';
 end $$;
 
+
+-- ---------- payments: start_payment / double-charge guard / refund ----------
+reset role;
+set request.jwt.claim.role = 'service_role';
+set request.jwt.claim.sub = '';
+do $$
+declare o orders; p products; pay payments; stock0 int; stock1 int;
+begin
+  -- fresh online order for customer A
+  perform set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-0000000000b1', true);
+  perform set_config('request.jwt.claim.role', 'authenticated', true);
+  select * into p from products where slug = 'smart-watch-pro';
+  o := create_order(jsonb_build_array(jsonb_build_object('product_id', p.id, 'quantity', 1)), '{}'::jsonb, 'online');
+  perform set_config('request.jwt.claim.sub', '', true);
+  perform set_config('request.jwt.claim.role', 'service_role', true);
+
+  pay := start_payment(o.id, 'waafipay', 'EVC_PLUS', '252612345678', 'T-1', 'r1',
+                       '00000000-0000-0000-0000-0000000000b1');
+  assert pay.amount = o.total, 'payment amount taken from order total';
+  assert (select payment_status from orders where id = o.id) = 'pending', 'order pending';
+
+  begin
+    perform start_payment(o.id, 'waafipay', 'EVC_PLUS', '252612345678', 'T-2', 'r2', null);
+    assert false, 'second concurrent attempt must fail';
+  exception when raise_exception then assert sqlerrm like '%PAYMENT_IN_PROGRESS%', 'in-progress code'; end;
+
+  -- simulate stale attempt -> next attempt allowed
+  update payments set created_at = now() - interval '10 minutes' where id = pay.id;
+  pay := start_payment(o.id, 'waafipay', 'ZAAD', '252631234567', 'T-3', 'r3', null);
+  assert (select status from payments where reference_id = 'T-1') = 'failed', 'stale attempt expired';
+
+  -- approve
+  update payments set status = 'approved', transaction_id = '123' where id = pay.id;
+  select stock into stock0 from products where id = p.id;
+  perform mark_order_paid(o.id);
+  begin
+    perform start_payment(o.id, 'waafipay', 'EVC_PLUS', '252612345678', 'T-4', 'r4', null);
+    assert false, 'paid order not payable';
+  exception when raise_exception then assert sqlerrm like '%ORDER_NOT_PAYABLE%', 'not payable code'; end;
+
+  -- refund restocks once
+  perform refund_order(o.id);
+  perform refund_order(o.id);
+  select stock into stock1 from products where id = p.id;
+  assert stock1 = stock0, 'refund restocked exactly once';
+  assert (select payment_status from orders where id = o.id) = 'refunded', 'order refunded';
+end $$;
+
+-- start_payment / refund_order are not callable by clients
+set role authenticated;
+set request.jwt.claim.role = 'authenticated';
+set request.jwt.claim.sub = '00000000-0000-0000-0000-0000000000b1';
+do $$ begin
+  begin
+    perform refund_order((select v::uuid from t_ctx where k='order_a'));
+    assert false, 'refund_order must be service-only';
+  exception when insufficient_privilege then null; end;
+end $$;
+
+-- stuck pending order can be cancelled after 3 minutes
+reset role;
+do $$
+declare o orders; p products;
+begin
+  perform set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-0000000000b1', true);
+  perform set_config('request.jwt.claim.role', 'authenticated', true);
+  select * into p from products where slug = 'running-shoes-elite';
+  o := create_order(jsonb_build_array(jsonb_build_object('product_id', p.id, 'quantity', 1)), '{}'::jsonb, 'online');
+  perform set_config('request.jwt.claim.role', 'service_role', true);
+  perform start_payment(o.id, 'waafipay', 'EVC_PLUS', '252612345678', 'T-9', 'r9', null);
+  perform set_config('request.jwt.claim.role', 'authenticated', true);
+  begin
+    perform cancel_order(o.id);
+    assert false, 'fresh in-flight payment blocks cancel';
+  exception when raise_exception then assert sqlerrm like '%PAYMENT_IN_PROGRESS%', 'blocked'; end;
+  update payments set created_at = now() - interval '5 minutes' where reference_id = 'T-9';
+  o := cancel_order(o.id, 'stuck');
+  assert o.status = 'cancelled' and o.payment_status = 'failed', 'stuck order cancelled';
+end $$;
+
 reset role;
 select 'ALL DB TESTS PASSED' as result;
